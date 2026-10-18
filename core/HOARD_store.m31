@@ -474,14 +474,14 @@ List<json.Value> strings(List<str> items) {
 }
 
 /// Write the config so that a crash at any instant leaves a complete document
-/// on disk: the new document goes to `<config>.temp`, created with mode 0600
+/// on disk: the new document goes to `<config>.tmp`, created with mode 0600
 /// because it holds password hashes, and is then renamed over the config. A
 /// rename within one filesystem is atomic, so a reader sees the old config or
 /// the new one, never half of either. The temp file sits beside the config
 /// because a rename across filesystems is not atomic.
 pub Result<void, str> save(str config_path, Config config) {
     str text = render(config)?;
-    str temp = config_path + ".temp";
+    str temp = config_path + ".tmp";
     if (fs.is_present(temp)) {
         // A stray from a crash may carry other permissions; `open` keeps a
         // file's mode, so start from nothing.
