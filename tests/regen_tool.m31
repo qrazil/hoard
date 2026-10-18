@@ -1,0 +1,25 @@
+// Runs the page generator once and prints its summary line.
+//
+//   t_pages_regen <git_dir> <out_dir> <repo> [--full]
+//
+// Not a unit test (it needs a repository); tests drive it against a
+// throwaway bare repository.
+
+import core.HOARD_pages;
+import os;
+
+List<str> argv = os.arguments();
+if (argv.size() < 4) {
+    print("usage: t_pages_regen <git_dir> <out_dir> <repo> [--full]");
+    os.exit(2);
+}
+bool is_full = argv.size() > 4 && argv[4] == "--full";
+match (HOARD_pages.regen(argv[1], argv[2], argv[3], "https://git.example.org/", is_full)) {
+    case Ok(str summary): {
+        print(summary);
+    }
+    case Err(str reason): {
+        print("error: " + reason);
+        os.exit(1);
+    }
+}

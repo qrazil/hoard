@@ -1,0 +1,157 @@
+// Client addresses behind reverse proxies.
+//
+// Damping keys failed logins by client address, and behind a proxy chain every
+// connection arrives from the last proxy. Each proxy appends the address it saw
+// to `X-Forwarded-For`, so the real client is found by walking that header from
+// the right, past every hop that is a trusted proxy, and stopping at the first
+// address that is not. A client cannot spoof its way past this: whatever it
+// writes into the header sits to the left of the address a trusted proxy
+// appended, and the walk stops at the first untrusted one.
+//
+// Entries in `trusted_proxies` are exact addresses (`127.0.0.1`, `::1`) or IPv4
+// CIDR blocks (`173.245.48.0/20`). IPv6 blocks are not supported: no trusted hop
+// in front of this server is an IPv6 range. An IPv6 *client* address works; it
+// is only ever a key.
+
+// An IPv4 dotted quad as an int, or None.
+pub Option<int> parse_ipv4(str text) {
+    List<str> parts = text.split(".");
+    if (parts.size() != 4) {
+        return Option<int>.None;
+    }
+    int value = 0;
+    for (str part in parts) {
+        if (part.size() == 0 || part.size() > 3 || !is_digits(part)) {
+            return Option<int>.None;
+        }
+        int octet = part.parse_int().or(256);
+        if (octet > 255) {
+            return Option<int>.None;
+        }
+        value = value * 256 + octet;
+    }
+    return Option<int>.Some(value);
+}
+
+bool is_digits(str text) {
+    for (int index in 0 .. text.size()) {
+        int byte = text.byte_at(index);
+        if (byte < '0' || byte > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The network and prefix length of an IPv4 CIDR block `a.b.c.d/n`, as a
+// two-element list, or None.
+Option<List<int>> parse_cidr4(str text) {
+    List<str> pieces = text.split("/");
+    if (pieces.size() != 2 || pieces[1].size() == 0 || pieces[1].size() > 2 || !is_digits(pieces[1])) {
+        return Option<List<int>>.None;
+    }
+    int bits = pieces[1].parse_int().or(99);
+    if (bits > 32) {
+        return Option<List<int>>.None;
+    }
+    match (parse_ipv4(pieces[0])) {
+        case Some(int network): {
+            List<int> out = [network, bits];
+            return Option<List<int>>.Some(out);
+        }
+        case None: {
+            return Option<List<int>>.None;
+        }
+    }
+}
+
+// The top `bits` of a 32-bit address set.
+int mask(int bits) {
+    if (bits == 0) {
+        return 0;
+    }
+    int all = 4294967295;
+    int low = 1;
+    for (int index in 0 .. 32 - bits) {
+        low = low * 2;
+    }
+    return all - (low - 1);
+}
+
+// Whether `entry` is something `trusted_proxies` can hold.
+pub bool is_valid_entry(str entry) {
+    if (entry.contains("/")) {
+        return parse_cidr4(entry).is_some();
+    }
+    if (parse_ipv4(entry).is_some()) {
+        return true;
+    }
+    if (!entry.contains(":") || entry.size() == 0) {
+        return false;
+    }
+    for (int index in 0 .. entry.size()) {
+        int byte = entry.byte_at(index);
+        bool is_hex = (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f') || (byte >= 'A' && byte <= 'F');
+        if (!is_hex && byte != ':' && byte != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Whether `address` is one of the `trusted` entries.
+pub bool is_trusted(str address, List<str> trusted) {
+    Option<int> parsed = parse_ipv4(address);
+    for (str entry in trusted) {
+        if (entry.contains("/")) {
+            match (parse_cidr4(entry)) {
+                case Some(List<int> block): {
+                    match (parsed) {
+                        case Some(int value): {
+                            int bits = mask(block[1]);
+                            if ((value & bits) == (block[0] & bits)) {
+                                return true;
+                            }
+                        }
+                        case None: {
+                        }
+                    }
+                }
+                case None: {
+                }
+            }
+        } else if (address == entry) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The client address: `peer` if it is not a trusted proxy, else the right-most
+// `X-Forwarded-For` hop that is not one.
+pub str client(str peer, Option<str> forwarded, List<str> trusted) {
+    if (!is_trusted(peer, trusted)) {
+        return peer;
+    }
+    str header = forwarded.or("");
+    if (header == "") {
+        return peer;
+    }
+    List<str> hops = [];
+    for (str hop in header.split(",")) {
+        str trimmed = hop.trim();
+        if (trimmed != "") {
+            hops.push(trimmed);
+        }
+    }
+    str address = peer;
+    int index = hops.size() - 1;
+    while (index >= 0) {
+        if (!is_trusted(address, trusted)) {
+            return address;
+        }
+        address = hops[index];
+        index = index - 1;
+    }
+    return address;
+}

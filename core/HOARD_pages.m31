@@ -1,0 +1,925 @@
+// The static page generator, stagit-style: a port of orogit's pages.oro.
+//
+// For one repository it writes, under its pages directory:
+//
+//     index.html                 summary: clone path, branches, tags, recent
+//                                commits, and the README as escaped text
+//     log.html                   the latest LOG_LIMIT commits
+//     files.html                 every file of the default branch
+//     file/<dir>.d/<name>.html   one page per file
+//     commit/<sha>.html          one page per commit, with its diff
+//
+// Everything comes from asking git -- `for-each-ref`, `log`, `ls-tree`,
+// `cat-file --batch`, `show` -- and every piece of text that came out of the
+// repository passes through `HOARD_html.escape` on its way into a page.
+//
+// THE SYMLINK RULE. A git repository may contain symlinks to anywhere --
+// `/etc/passwd`, `~/.ssh/id_ed25519`. So this generator never checks a
+// repository out and never copies a tree: every file under the pages
+// directory is one it wrote itself, as a regular file, from bytes git gave
+// it. A symlink in the repository becomes a page that *says* where the link
+// points; it is never a link on disk. The server refuses symlinks as well,
+// but this module must not depend on that.
+//
+// Each page is written to a temporary file and renamed over its path, so
+// the server never serves a half-written page. Stale pages -- a deleted file, a
+// commit force-pushed away -- are removed, and so are the directories they
+// leave empty.
+
+import core.HOARD_html;
+import date;
+import fs;
+import io;
+import net.http;
+import os;
+import proc;
+import random;
+import text;
+
+/// How many commits the log page (and the commit pages) cover.
+pub const int LOG_LIMIT = 200;
+/// How many commits the summary page lists.
+pub const int RECENT = 10;
+/// Blobs above this size are listed but not shown.
+pub const int MAX_BLOB = 512 * 1024;
+/// A commit page shows at most this much of its diff.
+pub const int MAX_DIFF = 256 * 1024;
+/// How many bytes of a blob are looked at to decide it is binary.
+pub const int SNIFF = 8000;
+const str UNIT_SEPARATOR = "\x1f";
+const str TEMP_SUFFIX = ".tmp";
+// A temporary file older than this was left by a generator that died.
+const int TEMP_MAX_AGE_NS = 600 * 1000 * 1000 * 1000;
+const str LOG_FORMAT = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b";
+const List<str> REF_PREFIXES = ["refs/heads/", "refs/tags/"];
+
+// --- talking to git ----------------------------------------------------------
+
+// One repository, and the clean environment every git command runs in: the
+// hook runs with GIT_DIR and friends set for the pushed repository, and
+// nothing inherited should steer these commands anywhere but `git_directory`.
+type Git {
+    str git_directory;
+    Map<str, str> env;
+}
+
+List<str> Git.command(List<str> arguments) {
+    List<str> argv = ["git", "--git-dir", git_directory];
+    for (str argument in arguments) {
+        argv.push(argument);
+    }
+    return argv;
+}
+
+// Run git to completion and return its stdout, or None when it fails.
+Option<bytes> Git.output(List<str> arguments) {
+    match (proc.run(command(arguments), env: Option<Map<str, str>>.Some(env), should_check: false, is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (done.is_success()) {
+                return Option<bytes>.Some(done.stdout);
+            }
+            return Option<bytes>.None;
+        }
+        case Err(_): {
+            return Option<bytes>.None;
+        }
+    }
+}
+
+// Start git with its standard input closed and its standard error drained
+// by a thread of its own, so a chatty git can never fill a pipe nobody reads.
+Result<proc.Proc, str> Git.launch(List<str> arguments) {
+    match (proc.start(command(arguments), env: Option<Map<str, str>>.Some(env))) {
+        case Ok(proc.Proc child): {
+            proc.Pipe errors = child.take_stderr();
+            spawn discard(errors);
+            return Result<proc.Proc, str>.Ok(child);
+        }
+        case Err(proc.Error error): {
+            return Result<proc.Proc, str>.Err("git " + arguments[0] + ": " + error.to_str());
+        }
+    }
+}
+
+// Stopping early drops the process, which kills and reaps it.
+Result<Capped, str> Git.capped(List<str> arguments, int cap) {
+    proc.Proc child = launch(arguments)?;
+    Result<bool, io.Error> closed = child.stdin.close();
+    bytes data = [];
+    while (data.size() <= cap) {
+        bytes chunk = read_some(child.stdout, 65536)?;
+        if (chunk.size() == 0) {
+            Result<os.ExitStatus, proc.Error> waited = child.wait();
+            return Result<Capped, str>.Ok(Capped(data, false));
+        }
+        data.extend(chunk);
+    }
+    data.truncate(cap);
+    return Result<Capped, str>.Ok(Capped(data, true));
+}
+
+// The contents of every blob in `shas`, through one `git cat-file --batch`.
+// The object names are written by a thread of its own while this one reads,
+// so neither side can fill a pipe and wait on the other.
+Result<Map<str, bytes>, str> Git.blobs(List<str> shas) {
+    Map<str, bytes> found = {};
+    if (shas.size() == 0) {
+        return Result<Map<str, bytes>, str>.Ok(found);
+    }
+    proc.Proc child = launch(["cat-file", "--batch"])?;
+    proc.Pipe sink = child.take_stdin();
+    bytes names = (shas.join("\n") + "\n").to_bytes();
+    spawn write_names(sink, names);
+    for (int i in 0 .. shas.size()) {
+        bytes header = read_line(child.stdout)?;
+        List<str> fields = text.split_whitespace(lossy(header));
+        // "<name> missing": nothing follows the header.
+        if (fields.size() == 2 && fields[1] == "missing") {
+            continue;
+        }
+        if (fields.size() != 3) {
+            break;
+        }
+        int size = -1;
+        match (fields[2].parse_int()) {
+            case Some(int parsed): {
+                size = parsed;
+            }
+            case None: {
+                break;
+            }
+        }
+        bytes data = read_exact(child.stdout, size)?;
+        bytes newline = read_exact(child.stdout, 1)?;
+        found.set(fields[0], data);
+    }
+    // Drain what is left so git can finish, then reap it.
+    match (child.stdout.read_all()) {
+        case Ok(bytes rest): {
+            Result<os.ExitStatus, proc.Error> waited = child.wait();
+        }
+        case Err(io.Error error): {
+            return Result<Map<str, bytes>, str>.Err("git cat-file: " + error.to_str());
+        }
+    }
+    return Result<Map<str, bytes>, str>.Ok(found);
+}
+
+Git open_git(str git_directory) {
+    str search_path = "/usr/local/bin:/usr/bin:/bin";
+    match (os.env("PATH")) {
+        case Some(str found): {
+            search_path = found;
+        }
+        case None: {
+        }
+    }
+    Map<str, str> clean = {"PATH": search_path, "LC_ALL": "C"};
+    match (os.env("HOME")) {
+        case Some(str home): {
+            clean.set("HOME", home);
+        }
+        case None: {
+        }
+    }
+    return Git(git_directory, clean);
+}
+
+// At most `cap` bytes of a command's stdout, and whether there was more.
+type Capped {
+    bytes data;
+    bool is_truncated;
+}
+
+void write_names(proc.Pipe sink, bytes names) {
+    Result<int, io.Error> wrote = sink.write(names);
+    Result<bool, io.Error> closed = sink.close();
+}
+
+void discard(proc.Pipe source) {
+    while (true) {
+        match (source.read(65536)) {
+            case Ok(bytes chunk): {
+                if (chunk.size() == 0) {
+                    return;
+                }
+            }
+            case Err(_): {
+                return;
+            }
+        }
+    }
+}
+
+Result<bytes, str> read_some(proc.Pipe source, int limit) {
+    match (source.read(limit)) {
+        case Ok(bytes chunk): {
+            return Result<bytes, str>.Ok(chunk);
+        }
+        case Err(io.Error error): {
+            return Result<bytes, str>.Err("reading from git: " + error.to_str());
+        }
+    }
+}
+
+Result<bytes, str> read_line(proc.Pipe source) {
+    match (source.read_until("\n".to_bytes(), 4096)) {
+        case Ok(bytes line): {
+            return Result<bytes, str>.Ok(line);
+        }
+        case Err(io.Error error): {
+            return Result<bytes, str>.Err("reading from git: " + error.to_str());
+        }
+    }
+}
+
+// Exactly `count` bytes, or an error if the stream ends first.
+Result<bytes, str> read_exact(proc.Pipe source, int count) {
+    bytes data = [];
+    while (data.size() < count) {
+        bytes chunk = read_some(source, count - data.size())?;
+        if (chunk.size() == 0) {
+            return Result<bytes, str>.Err("git cat-file: the output ended inside an object");
+        }
+        data.extend(chunk);
+    }
+    return Result<bytes, str>.Ok(data);
+}
+
+// --- text helpers ------------------------------------------------------------
+
+/// Bytes as text for display: strict UTF-8 when it is valid, and otherwise
+/// valid runs kept with U+FFFD for each byte that is not.
+pub str lossy(bytes raw) {
+    match (raw.utf8()) {
+        case Some(str decoded): {
+            return decoded;
+        }
+        case None: {
+        }
+    }
+    bytes replacement = "\u{FFFD}".to_bytes();
+    bytes out = [];
+    int start = 0;
+    int index = 0;
+    int size = raw.size();
+    while (index < size) {
+        int lead = raw[index];
+        if (lead < 0x80) {
+            index = index + 1;
+            continue;
+        }
+        int width = 1;
+        if (lead >= 0xF0) {
+            width = 4;
+        } else if (lead >= 0xE0) {
+            width = 3;
+        } else if (lead >= 0xC0) {
+            width = 2;
+        }
+        int stop = index + width;
+        if (stop > size) {
+            stop = size;
+        }
+        if (raw.substr(index, stop).utf8().is_some()) {
+            index = stop;
+        } else {
+            out.extend(raw.substr(start, index));
+            out.extend(replacement);
+            index = index + 1;
+            start = index;
+        }
+    }
+    out.extend(raw.substr(start, size));
+    match (out.utf8()) {
+        case Some(str repaired): {
+            return repaired;
+        }
+        case None: {
+            trap("lossy: the repaired text is not UTF-8");
+        }
+    }
+}
+
+/// Is this blob binary: a NUL in its first SNIFF bytes, or not UTF-8?
+pub bool is_binary(bytes data) {
+    int stop = data.size();
+    if (stop > SNIFF) {
+        stop = SNIFF;
+    }
+    bytes nul = [0];
+    if (data.substr(0, stop).contains(nul)) {
+        return true;
+    }
+    return data.utf8().is_none();
+}
+
+str esc(str raw) {
+    return HOARD_html.escape(raw);
+}
+
+/// A repository path, as its segments, as the href of its file page relative
+/// to the repository's pages root. Each segment is percent-encoded for the
+/// URL; the escape makes the result safe inside a double-quoted attribute.
+pub str file_href(List<str> segments) {
+    int last = segments.size() - 1;
+    List<str> parts = ["file"];
+    for (int i in 0 .. last) {
+        parts.push(http.quote(segments[i] + ".d", safe: ""));
+    }
+    parts.push(http.quote(segments[last] + ".html", safe: ""));
+    return esc(parts.join("/"));
+}
+
+/// The same page as a path on disk, relative to the repository's pages root.
+/// Directories carry a `.d` suffix and files an `.html` one, so a file
+/// `x.html` and a directory `x` can never both claim `x.html`.
+pub str file_disk_path(List<str> segments) {
+    int last = segments.size() - 1;
+    List<str> parts = ["file"];
+    for (int i in 0 .. last) {
+        parts.push(segments[i] + ".d");
+    }
+    parts.push(segments[last] + ".html");
+    return parts.join("/");
+}
+
+/// A diff as escaped HTML, one line per line: file headers bold, added lines
+/// class `a`, deleted lines class `d`, hunk headers class `h`.
+pub str diff_markup(str diff) {
+    List<str> lines = [];
+    for (str line in diff.split("\n")) {
+        str escaped = esc(line);
+        if (line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff --git")) {
+            lines.push("<b>" + escaped + "</b>");
+        } else if (line.starts_with("+")) {
+            lines.push("<span class=\"a\">" + escaped + "</span>");
+        } else if (line.starts_with("-")) {
+            lines.push("<span class=\"d\">" + escaped + "</span>");
+        } else if (line.starts_with("@@")) {
+            lines.push("<span class=\"h\">" + escaped + "</span>");
+        } else {
+            lines.push(escaped);
+        }
+    }
+    return lines.join("\n");
+}
+
+// `whole` split at the first `limit` occurrences of `separator`: at most
+// `limit + 1` fields, the last holding the rest.
+List<str> split_limited(str whole, str separator, int limit) {
+    List<str> fields = [];
+    str rest = whole;
+    while (fields.size() < limit) {
+        match (rest.index_of(separator)) {
+            case Some(int found): {
+                fields.push(rest.substr(0, found));
+                rest = rest.substr(found + separator.size(), rest.size());
+            }
+            case None: {
+                break;
+            }
+        }
+    }
+    fields.push(rest);
+    return fields;
+}
+
+bool is_hex(str name) {
+    if (name.size() != 40 && name.size() != 64) {
+        return false;
+    }
+    for (int octet in name.to_bytes()) {
+        if (!((octet >= '0' && octet <= '9') || (octet >= 'a' && octet <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// --- what the pages describe --------------------------------------------------
+
+type Commit {
+    str sha;
+    List<str> parents;
+    str author;
+    str email;
+    str authored;
+    str subject;
+    str body;
+}
+
+type Entry {
+    str mode;
+    str kind;
+    str sha;
+    int size;
+    str path;
+    List<str> segments;
+    // The href of its page, "" while it has none.
+    str page = "";
+}
+
+// A branch or a tag: its commit, its short name, and which kind it is.
+type Ref {
+    str sha;
+    str name;
+    str prefix;
+}
+
+// The branch the pages describe and its commit; "" and "" for an empty
+// repository.
+type Tip {
+    str branch;
+    str sha;
+}
+
+// --- the generator -----------------------------------------------------------
+
+/// Regenerate the pages of `repo`, whose bare repository is `git_directory`, into
+/// `out_directory` (the repository's own pages directory, where its `index.html`
+/// goes). `base_url` is the server's public URL, for the clone command on
+/// the summary page. `is_full` rewrites commit pages that already exist
+/// (they are otherwise kept: a commit never changes). Returns a one-line
+/// summary.
+///
+/// Two pushes close together run two generators at once. Each one renders
+/// again until the branch it rendered is still the branch tip afterwards, so
+/// the last generator to finish has rendered the newest commit.
+pub Result<str, str> regen(str git_directory, str out_directory, str repo, str base_url, bool is_full) {
+    Git git = open_git(git_directory);
+    make_directories(out_directory)?;
+    str summary = "";
+    for (int i in 0 .. 5) {
+        Tip tip = tip_of(git);
+        summary = render(git, repo, base_url, out_directory, tip, is_full)?;
+        Tip after = tip_of(git);
+        if (after.branch == tip.branch && after.sha == tip.sha) {
+            break;
+        }
+    }
+    return Result<str, str>.Ok(summary);
+}
+
+// HEAD when it resolves, otherwise the first branch, otherwise an empty Tip.
+Tip tip_of(Git git) {
+    Option<bytes> head = git.output(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    Option<bytes> name = git.output(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    match (head) {
+        case Some(bytes sha): {
+            str label = "HEAD";
+            match (name) {
+                case Some(bytes branch): {
+                    label = lossy(branch).trim();
+                }
+                case None: {
+                }
+            }
+            return Tip(label, lossy(sha).trim());
+        }
+        case None: {
+        }
+    }
+    List<Ref> heads = [];
+    for (Ref found in refs_of(git)) {
+        if (found.prefix == "refs/heads/") {
+            heads.push(found);
+        }
+    }
+    if (heads.size() == 0) {
+        return Tip("", "");
+    }
+    // HEAD names a branch nobody pushed (a first push of `master` to a
+    // repository created with `main`, say). Point it at a branch that
+    // exists, so clones check something out and the pages have a default
+    // branch.
+    Option<bytes> repointed = git.output(["symbolic-ref", "HEAD", "refs/heads/" + heads[0].name]);
+    return Tip(heads[0].name, heads[0].sha);
+}
+
+// Branches and tags, in refname order.
+List<Ref> refs_of(Git git) {
+    List<Ref> refs = [];
+    bytes raw = [];
+    match (git.output(["for-each-ref", "--format=%(objectname)%00%(refname)", "refs/heads", "refs/tags"])) {
+        case Some(bytes listing): {
+            raw = listing;
+        }
+        case None: {
+            return refs;
+        }
+    }
+    for (str line in lossy(raw).split("\n")) {
+        List<str> fields = line.split("\0");
+        if (fields.size() != 2) {
+            continue;
+        }
+        for (str prefix in REF_PREFIXES) {
+            if (fields[1].starts_with(prefix)) {
+                refs.push(Ref(fields[0], text.strip_prefix(fields[1], prefix), prefix));
+            }
+        }
+    }
+    return refs;
+}
+
+Result<str, str> render(Git git, str repo, str base_url, str out, Tip tip, bool is_full) {
+    Map<str, bool> keep = {};
+    List<Commit> commits = [];
+    List<Entry> entries = [];
+    int total = 0;
+    if (tip.sha != "") {
+        commits = log_of(git, tip.sha);
+        entries = tree_of(git, tip.sha);
+        total = commits.size();
+        match (git.output(["rev-list", "--count", tip.sha])) {
+            case Some(bytes count): {
+                total = lossy(count).trim().parse_int().or(commits.size());
+            }
+            case None: {
+            }
+        }
+    }
+    make_directories(fs.join(out, "commit"))?;
+    make_directories(fs.join(out, "file"))?;
+    for (Commit commit in commits) {
+        str relative = "commit/" + commit.sha + ".html";
+        keep.set(relative, true);
+        str path = fs.join(out, relative);
+        if (is_full || !fs.is_file(path) || fs.is_link(path)) {
+            write_file(out, path, commit_page(git, repo, commit)?)?;
+        }
+    }
+    Map<str, bytes> contents = file_pages(git, repo, out, entries, keep)?;
+    write_file(out, fs.join(out, "log.html"), log_page(repo, commits, total))?;
+    write_file(out, fs.join(out, "files.html"), files_page(repo, tip.branch, entries))?;
+    write_file(out, fs.join(out, "index.html"), summary_page(git, repo, base_url, tip.branch, commits, entries, contents))?;
+    int removed = remove_stale(out, "commit", keep) + remove_stale(out, "file", keep);
+    remove_abandoned(out);
+    return Result<str, str>.Ok("hoard: pages for " + repo + ": " + str(commits.size()) + " commits, " + str(entries.size()) + " files, " + str(removed) + " stale pages removed");
+}
+
+List<Commit> log_of(Git git, str sha) {
+    List<Commit> commits = [];
+    bytes raw = [];
+    match (git.output(["log", "-z", "--max-count=" + str(LOG_LIMIT), LOG_FORMAT, sha, "--"])) {
+        case Some(bytes listing): {
+            raw = listing;
+        }
+        case None: {
+            return commits;
+        }
+    }
+    bytes nul = [0];
+    for (bytes record in raw.split(nul)) {
+        List<str> fields = split_limited(lossy(record), UNIT_SEPARATOR, 6);
+        if (fields.size() == 7 && is_hex(fields[0])) {
+            commits.push(Commit(fields[0], text.split_whitespace(fields[1]), fields[2], fields[3], fields[4], fields[5], fields[6]));
+        }
+    }
+    return commits;
+}
+
+List<Entry> tree_of(Git git, str sha) {
+    List<Entry> entries = [];
+    bytes raw = [];
+    match (git.output(["ls-tree", "-r", "-l", "-z", "--full-tree", sha])) {
+        case Some(bytes listing): {
+            raw = listing;
+        }
+        case None: {
+            return entries;
+        }
+    }
+    bytes nul = [0];
+    bytes tab = [9];
+    for (bytes record in raw.split(nul)) {
+        int tab_at = -1;
+        match (record.index_of(tab)) {
+            case Some(int found): {
+                tab_at = found;
+            }
+            case None: {
+                continue;
+            }
+        }
+        List<str> meta = text.split_whitespace(lossy(record.substr(0, tab_at)));
+        if (meta.size() != 4) {
+            continue;
+        }
+        str path = lossy(record.substr(tab_at + 1, record.size()));
+        int size = -1;
+        if (meta[3] != "-") {
+            size = meta[3].parse_int().or(-1);
+        }
+        entries.push(Entry(meta[0], meta[1], meta[2], size, path, path.split("/")));
+    }
+    return entries;
+}
+
+// One page per entry. Returns the blobs it read, for the summary's README.
+Result<Map<str, bytes>, str> file_pages(Git git, str repo, str out, List<Entry> entries, Map<str, bool> keep) {
+    List<str> wanted = [];
+    Map<str, bool> seen = {};
+    for (Entry entry in entries) {
+        if (entry.kind == "blob" && entry.size <= MAX_BLOB && !seen.contains(entry.sha)) {
+            seen.set(entry.sha, true);
+            wanted.push(entry.sha);
+        }
+    }
+    Map<str, bytes> contents = git.blobs(wanted)?;
+    for (int i in 0 .. entries.size()) {
+        Entry entry = entries[i];
+        str relative = file_disk_path(entry.segments);
+        str prefix = "../".repeat(entry.segments.size());
+        str body = file_body(entry, contents.get(entry.sha));
+        str page = HOARD_html.document(entry.path + " - " + repo, prefix, body, repo);
+        if (write_page(out, relative, page).is_ok()) {
+            keep.set(relative, true);
+            entry.page = file_href(entry.segments);
+        }
+    }
+    return Result<Map<str, bytes>, str>.Ok(contents);
+}
+
+str file_body(Entry entry, Option<bytes> blob) {
+    str head = "<h2 class=\"mono\">" + esc(entry.path) + "</h2>";
+    str info = "<p class=\"muted\">mode " + esc(entry.mode) + ", " + esc(entry.kind) + " " + esc(entry.sha) + "</p>";
+    if (entry.kind == "commit") {
+        return head + info + "<p>Submodule at this commit.</p>";
+    }
+    bytes data = [];
+    match (blob) {
+        case Some(bytes found): {
+            data = found;
+        }
+        case None: {
+            return head + info + "<p>File too large to show (" + str(entry.size) + " bytes).</p>";
+        }
+    }
+    if (entry.size > MAX_BLOB) {
+        return head + info + "<p>File too large to show (" + str(entry.size) + " bytes).</p>";
+    }
+    if (entry.mode == "120000") {
+        return head + info + "<p>Symbolic link to <code>" + esc(lossy(data)) + "</code> (not followed).</p>";
+    }
+    if (is_binary(data)) {
+        return head + info + "<p>Binary file, " + str(entry.size) + " bytes.</p>";
+    }
+    return head + info + "<pre>" + esc(lossy(data)) + "</pre>";
+}
+
+Result<str, str> commit_page(Git git, str repo, Commit commit) {
+    Capped diff = git.capped(["show", "--no-color", "--stat", "--patch", "--diff-merges=first-parent", "--format=", commit.sha, "--"], MAX_DIFF)?;
+    List<str> parts = ["<h2>" + esc(commit.subject) + "</h2>", "<table>"];
+    parts.push("<tr><th>commit</th><td class=\"mono\">" + esc(commit.sha) + "</td></tr>");
+    for (str parent in commit.parents) {
+        parts.push("<tr><th>parent</th><td class=\"mono\"><a href=\"" + esc(parent) + ".html\">" + esc(parent) + "</a></td></tr>");
+    }
+    parts.push("<tr><th>author</th><td>" + esc(commit.author) + " &lt;" + esc(commit.email) + "&gt;</td></tr>");
+    parts.push("<tr><th>date</th><td>" + esc(commit.authored) + "</td></tr>");
+    parts.push("</table>");
+    if (commit.body.trim() != "") {
+        parts.push("<pre>" + esc(text.trim_end(commit.body)) + "</pre>");
+    }
+    parts.push("<pre>" + diff_markup(lossy(diff.data)) + "</pre>");
+    if (diff.is_truncated) {
+        parts.push("<p class=\"muted\">Diff truncated at " + str(MAX_DIFF) + " bytes.</p>");
+    }
+    return Result<str, str>.Ok(HOARD_html.document(commit.subject + " - " + repo, "../", parts.join("\n"), repo));
+}
+
+str commit_rows(List<Commit> commits, str prefix) {
+    List<str> rows = ["<table><tr><th>Date</th><th>Message</th><th>Author</th></tr>"];
+    for (Commit commit in commits) {
+        str day = commit.authored;
+        if (day.size() > 10) {
+            day = day.substr(0, 10);
+        }
+        rows.push("<tr><td class=\"mono\">" + esc(day) + "</td><td><a href=\"" + prefix + "commit/" + esc(commit.sha) + ".html\">" + esc(commit.subject) + "</a></td><td>" + esc(commit.author) + "</td></tr>");
+    }
+    rows.push("</table>");
+    return rows.join("\n");
+}
+
+str log_page(str repo, List<Commit> commits, int total) {
+    str body = "<p>This repository has no commits yet.</p>";
+    if (commits.size() > 0) {
+        str note = "";
+        if (total > commits.size()) {
+            note = "<p class=\"muted\">Showing the latest " + str(commits.size()) + " of " + str(total) + " commits.</p>";
+        }
+        body = "<h2>Log</h2>" + note + commit_rows(commits, "");
+    }
+    return HOARD_html.document("log - " + repo, "", body, repo);
+}
+
+str files_page(str repo, str branch, List<Entry> entries) {
+    if (entries.size() == 0) {
+        return HOARD_html.document("files - " + repo, "", "<p>No files.</p>", repo);
+    }
+    List<str> rows = ["<h2>Files on " + esc(branch) + "</h2>", "<table><tr><th>Mode</th><th>Name</th><th class=\"num\">Size</th></tr>"];
+    for (Entry entry in entries) {
+        str name = esc(entry.path);
+        if (entry.page != "") {
+            name = "<a href=\"" + entry.page + "\">" + name + "</a>";
+        }
+        str size = "";
+        if (entry.size >= 0) {
+            size = str(entry.size);
+        }
+        rows.push("<tr><td class=\"mono\">" + esc(entry.mode) + "</td><td class=\"mono\">" + name + "</td><td class=\"num\">" + size + "</td></tr>");
+    }
+    rows.push("</table>");
+    return HOARD_html.document("files - " + repo, "", rows.join("\n"), repo);
+}
+
+str summary_page(Git git, str repo, str base_url, str branch, List<Commit> commits, List<Entry> entries, Map<str, bytes> contents) {
+    List<str> parts = ["<h1>" + esc(repo) + "</h1>"];
+    parts.push("<p>Clone: <code>git clone " + esc(text.strip_suffix(base_url, "/")) + "/" + esc(repo) + ".git</code></p>");
+    if (commits.size() == 0) {
+        parts.push("<p>This repository is empty.</p>");
+        return HOARD_html.document(repo, "", parts.join("\n"), repo);
+    }
+    List<Ref> refs = refs_of(git);
+    List<str> titles = ["Branches", "Tags"];
+    for (int i in 0 .. titles.size()) {
+        List<str> rows = [];
+        for (Ref found in refs) {
+            if (found.prefix == REF_PREFIXES[i]) {
+                str short = found.sha;
+                if (short.size() > 12) {
+                    short = short.substr(0, 12);
+                }
+                rows.push("<tr><td class=\"mono\">" + esc(found.name) + "</td><td class=\"mono\">" + esc(short) + "</td></tr>");
+            }
+        }
+        if (rows.size() == 0) {
+            continue;
+        }
+        parts.push("<h3>" + titles[i] + "</h3><table>");
+        for (str row in rows) {
+            parts.push(row);
+        }
+        parts.push("</table>");
+    }
+    parts.push("<h3>Recent commits on " + esc(branch) + "</h3>");
+    List<Commit> recent = commits;
+    if (recent.size() > RECENT) {
+        recent = commits.slice(0, RECENT);
+    }
+    parts.push(commit_rows(recent, ""));
+    for (Entry entry in entries) {
+        if (entry.kind != "blob" || entry.path.contains("/")) {
+            continue;
+        }
+        str stem = text.strip_suffix(text.strip_suffix(text.strip_suffix(entry.path.to_lower(), ".md"), ".txt"), ".rst");
+        if (stem != "readme") {
+            continue;
+        }
+        if (entry.size <= MAX_BLOB) {
+            match (contents.get(entry.sha)) {
+                case Some(bytes data): {
+                    if (!is_binary(data)) {
+                        parts.push("<h3>" + esc(entry.path) + "</h3>");
+                        parts.push("<pre>" + esc(lossy(data)) + "</pre>");
+                    }
+                }
+                case None: {
+                }
+            }
+        }
+        break;
+    }
+    return HOARD_html.document(repo, "", parts.join("\n"), repo);
+}
+
+// --- writing files -----------------------------------------------------------
+
+Result<void, str> make_directories(str path) {
+    match (fs.makedirs(path)) {
+        case Ok(_): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error error): {
+            return Result<void, str>.Err(path + ": " + error.to_str());
+        }
+    }
+}
+
+// Write `content` to `path` as a regular file, atomically: into a temporary
+// file of a random name at the top of `out` (the same file system), then
+// renamed over `path`. A rename replaces whatever name is at `path`, a
+// symlink included, and never writes through one. The name is random rather
+// than `<path>.tmp` because two generators run at once after two quick
+// pushes, and a shared temporary name lets one rename the other's
+// half-written file into place.
+Result<void, str> write_file(str out, str path, str content) {
+    str temp = fs.join(out, "." + random.system().hex(8) + TEMP_SUFFIX);
+    match (io.write(temp, content)) {
+        case Ok(_): {
+        }
+        case Err(io.Error error): {
+            Result<bool, io.Error> cleaned = fs.remove(temp);
+            return Result<void, str>.Err(path + ": " + error.to_str());
+        }
+    }
+    match (fs.rename(temp, path)) {
+        case Ok(_): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error error): {
+            Result<bool, io.Error> cleaned = fs.remove(temp);
+            return Result<void, str>.Err(path + ": " + error.to_str());
+        }
+    }
+}
+
+// Remove temporary files a generator left at the top of `out` when it died
+// between writing and renaming. Only old ones: a young one may belong to a
+// generator running now.
+void remove_abandoned(str out) {
+    match (fs.listdir(out)) {
+        case Ok(List<str> names): {
+            int cutoff = date.now_ns() - TEMP_MAX_AGE_NS;
+            for (str name in names) {
+                if (!name.starts_with(".") || !name.ends_with(TEMP_SUFFIX)) {
+                    continue;
+                }
+                str path = fs.join(out, name);
+                bool is_abandoned = fs.is_link(path);
+                match (fs.stat(path)) {
+                    case Ok(fs.Stat found): {
+                        if (found.mtime_ns < cutoff) {
+                            is_abandoned = true;
+                        }
+                    }
+                    case Err(_): {
+                    }
+                }
+                if (is_abandoned) {
+                    Result<bool, io.Error> gone = fs.remove(path);
+                }
+            }
+        }
+        case Err(_): {
+        }
+    }
+}
+
+// Write a page at `relative` under `out`, creating its directories. An
+// error when the filesystem refuses (a name longer than the filesystem
+// allows, say): the caller then lists the file without a page rather than
+// failing the run.
+Result<void, str> write_page(str out, str relative, str content) {
+    List<str> parts = relative.split("/");
+    str directory = parts.slice(0, parts.size() - 1).join("/");
+    make_directories(fs.join(out, directory))?;
+    return write_file(out, fs.join(out, relative), content);
+}
+
+// Remove every file under `out/sub` that this run did not write, so a
+// deleted file or a force-pushed-away commit does not stay published, and
+// every directory that leaves empty. Returns how many files went. A symlink
+// is never something this module wrote, so one is always removed.
+int remove_stale(str out, str sub, Map<str, bool> keep) {
+    str base = fs.join(out, sub);
+    if (fs.is_link(base) || !fs.is_directory(base)) {
+        return 0;
+    }
+    List<str> names = [];
+    match (fs.listdir(base)) {
+        case Ok(List<str> listed): {
+            names = listed;
+        }
+        case Err(_): {
+            return 0;
+        }
+    }
+    int removed = 0;
+    for (str name in names) {
+        str relative = sub + "/" + name;
+        str path = fs.join(out, relative);
+        if (fs.is_link(path)) {
+            if (fs.remove(path).is_ok()) {
+                removed = removed + 1;
+            }
+        } else if (fs.is_directory(path)) {
+            removed = removed + remove_stale(out, relative, keep);
+            match (fs.listdir(path)) {
+                case Ok(List<str> left): {
+                    if (left.size() == 0) {
+                        Result<bool, io.Error> gone = fs.rmdir(path);
+                    }
+                }
+                case Err(_): {
+                }
+            }
+        } else if (!keep.contains(relative)) {
+            if (fs.remove(path).is_ok()) {
+                removed = removed + 1;
+            }
+        }
+    }
+    return removed;
+}

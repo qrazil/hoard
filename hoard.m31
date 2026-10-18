@@ -1,0 +1,435 @@
+// hoard -- a small self-hosted git server: HTTP only, Basic auth, static
+// browsable pages. See README.md and docs/design.md.
+//
+//     hoard [--config FILE] -<command> [args] [-<command> ...]
+//     hoard --help                 the commands
+//     hoard -<command> --help      one command's arguments
+//
+// The config file defaults to $HOARD_CONFIG, then ./hoard.json.
+//
+// The command line is `lib/args`, Oro's grammar: `-word` is a command,
+// `--word` an option, anything else data, so several commands fit on one line:
+//
+//     hoard -addrepo site --public -grant site alice write
+//
+// The whole line is parsed before any of it runs. The commands then run in
+// the order typed and the first one to fail stops the rest. Every command that
+// changes the config holds the admin lock (`<config>.lock`) while it does.
+
+import args;
+import core.HOARD_addr;
+import core.HOARD_crypt;
+import core.HOARD_pages;
+import core.HOARD_server;
+import core.HOARD_store;
+import fs;
+import io;
+import os;
+import proc;
+
+const str VERSION = "0.1.0";
+
+args.Parser table = args.Parser("hoard", summary: "a small self-hosted git server: HTTP only, Basic auth, static browsable pages");
+table.version = VERSION;
+table.value("config", placeholder: "FILE", default: os.env("HOARD_CONFIG").or("hoard.json"), help: "the config file");
+args.Parser init = table.command("init", "create the config, repos/, pages/ and hooks/");
+init.value("listen", placeholder: "ADDR", default: "127.0.0.1:8789", help: "the address to serve on");
+init.value("base-url", placeholder: "URL", help: "the public URL, shown in clone commands");
+args.Parser serving = table.command("serve", "run the server", short: "s");
+serving.value("listen", placeholder: "ADDR", help: "the address to serve on, instead of the configured one");
+serving.integer("workers", placeholder: "N", default: "16", min: "1", max: "1024", help: "worker threads; each serves one connection at a time");
+args.Parser adduser = table.command("adduser", "add a user; the password is read from stdin");
+adduser.positional("name", help: "the user name");
+args.Parser passwd = table.command("passwd", "change a password; read from stdin");
+passwd.positional("name", help: "the user name");
+args.Parser deluser = table.command("deluser", "remove a user and all their grants");
+deluser.positional("name", help: "the user name");
+args.Parser addrepo = table.command("addrepo", "create a bare repository");
+addrepo.flag("public", help: "anonymous users may read it");
+addrepo.positional("name", help: "the repository name");
+args.Parser adopt = table.command("adopt", "take over an existing bare repository under repos/ (an orogit move)");
+adopt.flag("public", help: "anonymous users may read it");
+adopt.positional("name", help: "the repository name; repos/NAME.git must exist");
+args.Parser grant = table.command("grant", "give a user access to a repository");
+grant.positional("repo", help: "the repository");
+grant.positional("user", help: "the user");
+grant.positional("level", help: "read or write");
+args.Parser revoke = table.command("revoke", "take a user's access away");
+revoke.positional("repo", help: "the repository");
+revoke.positional("user", help: "the user");
+args.Parser visibility = table.command("visibility", "whether anonymous users may read it");
+visibility.positional("repo", help: "the repository");
+visibility.positional("level", help: "public or private");
+args.Parser proxies = table.command("proxies", "show, or replace, the trusted proxy list");
+proxies.values("set", placeholder: "ENTRY", help: "replace the list with these IP addresses or IPv4 CIDR blocks");
+args.Parser regen = table.command("regen", "rebuild a repository's pages");
+regen.flag("hook", help: "called from post-receive: keep the pages that are already built");
+regen.positional("name", help: "the repository name");
+table.command("list", "show users and repositories", short: "l");
+table.completions();
+args.Parsed given = table.parse_or_exit(os.arguments().slice(1, os.arguments().size()), status: 64);
+str config_path = HOARD_store.absolute(given.value("config").or("hoard.json"), HOARD_store.current_directory());
+List<args.Parsed> commands = given.commands();
+if (commands.size() == 0) {
+    table.fail("hoard needs a command; see hoard --help", status: 64);
+}
+for (args.Parsed command in commands) {
+    match (dispatch(config_path, command)) {
+        case Ok: {
+        }
+        case Err(str problem): {
+            io.eprint("hoard: " + problem + "\n");
+            os.exit(1);
+        }
+    }
+}
+
+Result<void, str> dispatch(str path, args.Parsed command) {
+    str word = command.word();
+    if (word == "init") {
+        return cmd_init(path, command);
+    }
+    if (word == "serve") {
+        return cmd_serve(path, command);
+    }
+    if (word == "regen") {
+        return cmd_regen(path, command);
+    }
+    if (word == "list") {
+        return cmd_list(path);
+    }
+    if (word == "proxies" && !command.is_given("set")) {
+        HOARD_store.Config config = HOARD_store.load(path)?;
+        for (str entry in config.trusted_proxies) {
+            print(entry);
+        }
+        return Result<void, str>.Ok;
+    }
+    // Everything else changes the config: one at a time.
+    HOARD_store.lock(path)?;
+    Result<void, str> outcome = change(path, command);
+    HOARD_store.unlock(path);
+    return outcome;
+}
+
+Result<void, str> change(str path, args.Parsed command) {
+    str word = command.word();
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    if (word == "adduser" || word == "passwd") {
+        str name = command.positional("name");
+        bool is_adding = word == "adduser";
+        if (!HOARD_store.is_valid_user_name(name)) {
+            return Result<void, str>.Err("invalid user name '" + name + "' (letters, digits, '.', '_', '-')");
+        }
+        bool is_known = config.users.contains(name);
+        if (is_adding && is_known) {
+            return Result<void, str>.Err("user '" + name + "' already exists; use -passwd");
+        }
+        if (!is_adding && !is_known) {
+            return Result<void, str>.Err("no user '" + name + "'");
+        }
+        str password = read_password()?;
+        config.users.set(name, HOARD_crypt.hash_password(password)?);
+        HOARD_store.save(path, config)?;
+        if (is_adding) {
+            print("added user " + name);
+        } else {
+            print("updated user " + name);
+        }
+        return Result<void, str>.Ok;
+    }
+    if (word == "deluser") {
+        str name = command.positional("name");
+        if (!config.users.contains(name)) {
+            return Result<void, str>.Err("no user '" + name + "'");
+        }
+        config.users.remove(name);
+        for (str repo in config.repos.keys()) {
+            HOARD_store.Repo entry = repo_of(config, repo)?;
+            drop_user(entry, name);
+        }
+        HOARD_store.save(path, config)?;
+        print("deleted user " + name);
+        return Result<void, str>.Ok;
+    }
+    if (word == "addrepo" || word == "adopt") {
+        return add_repo(path, config, command.positional("name"), command.is_flag_set("public"), word == "adopt");
+    }
+    if (word == "grant") {
+        str repo = command.positional("repo");
+        str user = command.positional("user");
+        str level = command.positional("level");
+        if (level != "read" && level != "write") {
+            return Result<void, str>.Err("the level is read or write");
+        }
+        HOARD_store.Repo entry = repo_of(config, repo)?;
+        if (!config.users.contains(user)) {
+            return Result<void, str>.Err("no user '" + user + "'");
+        }
+        drop_user(entry, user);
+        if (level == "read") {
+            entry.readers.push(user);
+        } else {
+            entry.writers.push(user);
+        }
+        HOARD_store.save(path, config)?;
+        print(user + " may now " + level + " " + repo);
+        return Result<void, str>.Ok;
+    }
+    if (word == "revoke") {
+        str repo = command.positional("repo");
+        str user = command.positional("user");
+        HOARD_store.Repo entry = repo_of(config, repo)?;
+        drop_user(entry, user);
+        HOARD_store.save(path, config)?;
+        print("revoked " + user + " on " + repo);
+        return Result<void, str>.Ok;
+    }
+    if (word == "visibility") {
+        str repo = command.positional("repo");
+        str level = command.positional("level");
+        if (level != "public" && level != "private") {
+            return Result<void, str>.Err("the visibility is public or private");
+        }
+        HOARD_store.Repo entry = repo_of(config, repo)?;
+        entry.is_public = level == "public";
+        HOARD_store.save(path, config)?;
+        print(repo + " is now " + level);
+        return Result<void, str>.Ok;
+    }
+    if (word == "proxies") {
+        List<str> entries = command.values("set");
+        for (str entry in entries) {
+            if (!HOARD_addr.is_valid_entry(entry)) {
+                return Result<void, str>.Err("'" + entry + "' is not an IP address or an IPv4 CIDR block");
+            }
+        }
+        config.trusted_proxies = entries;
+        HOARD_store.save(path, config)?;
+        print(entries.size().to_str() + " trusted proxy entries");
+        return Result<void, str>.Ok;
+    }
+    return Result<void, str>.Err("'-" + word + "' is a declared command with no implementation");
+}
+
+Result<HOARD_store.Repo, str> repo_of(HOARD_store.Config config, str name) {
+    match (config.repos.get(name)) {
+        case Some(HOARD_store.Repo entry): {
+            return Result<HOARD_store.Repo, str>.Ok(entry);
+        }
+        case None: {
+            return Result<HOARD_store.Repo, str>.Err("no repository '" + name + "'");
+        }
+    }
+}
+
+void drop_user(HOARD_store.Repo entry, str user) {
+    List<str> readers = [];
+    for (str reader in entry.readers) {
+        if (reader != user) {
+            readers.push(reader);
+        }
+    }
+    List<str> writers = [];
+    for (str writer in entry.writers) {
+        if (writer != user) {
+            writers.push(writer);
+        }
+    }
+    entry.readers = readers;
+    entry.writers = writers;
+}
+
+// One line from stdin, never argv, where `ps` shows it to every user.
+Result<str, str> read_password() {
+    match (io.read_line_of(io.stdin(), 4096)) {
+        case Ok(Option<str> maybe): {
+            str line = maybe.or("");
+            if (line.ends_with("\n")) {
+                line = line.substr(0, line.size() - 1);
+            }
+            if (line.ends_with("\r")) {
+                line = line.substr(0, line.size() - 1);
+            }
+            str problem = HOARD_crypt.password_problem(line);
+            if (problem != "") {
+                return Result<str, str>.Err(problem);
+            }
+            return Result<str, str>.Ok(line);
+        }
+        case Err(io.Error failure): {
+            return Result<str, str>.Err("could not read the password: " + failure.to_str());
+        }
+    }
+}
+
+// --- init and serve ----------------------------------------------------------
+
+Result<void, str> cmd_init(str path, args.Parsed command) {
+    if (fs.is_present(path)) {
+        return Result<void, str>.Err(path + " already exists");
+    }
+    HOARD_store.Config config = HOARD_store.default_config();
+    config.listen = command.value("listen").or(config.listen);
+    config.base_url = command.value("base-url").or("");
+    HOARD_store.make_dirs(HOARD_store.parent_directory(path))?;
+    HOARD_store.make_dirs(HOARD_store.repo_root(config, path))?;
+    HOARD_store.make_dirs(HOARD_store.pages_root(config, path))?;
+    write_hook(path)?;
+    HOARD_store.save(path, config)?;
+    print("created " + path);
+    return Result<void, str>.Ok;
+}
+
+str hooks_directory(str path) {
+    return fs.join(HOARD_store.parent_directory(path), "hooks");
+}
+
+// This program's own absolute path, for the hook to run.
+Result<str, str> self_path() {
+    match (fs.realpath("/proc/self/exe")) {
+        case Ok(str real): {
+            return Result<str, str>.Ok(real);
+        }
+        case Err(_): {
+        }
+    }
+    str argv0 = os.arguments()[0];
+    if (argv0.contains("/")) {
+        match (fs.realpath(HOARD_store.absolute(argv0, HOARD_store.current_directory()))) {
+            case Ok(str real): {
+                return Result<str, str>.Ok(real);
+            }
+            case Err(_): {
+            }
+        }
+    }
+    return Result<str, str>.Err("could not find this program's own path for the hook");
+}
+
+/// Write `hooks/post-receive` beside the config: a shell script, mode 0755,
+/// that runs this binary to rebuild the pushed repository's pages. A push must
+/// not fail because its pages did not rebuild, so it always exits 0.
+Result<void, str> write_hook(str path) {
+    str program = self_path()?;
+    if (program.contains("'") || path.contains("'")) {
+        return Result<void, str>.Err("a path with a single quote cannot go into the hook script");
+    }
+    str directory = hooks_directory(path);
+    HOARD_store.make_dirs(directory)?;
+    str hook = fs.join(directory, "post-receive");
+    str script = "#!/bin/sh\n# Written by hoard -init: rebuild the pushed repository's pages.\ncat >/dev/null\nrepo=$(git config --get hoard.repo) || { echo 'hoard: no hoard.repo setting; pages not rebuilt'; exit 0; }\n'" + program + "' --config '" + path + "' -regen --hook \"$repo\" || echo 'hoard: page generation failed'\nexit 0\n";
+    if (fs.is_present(hook)) {
+        match (fs.remove(hook)) {
+            case Ok(_): {
+            }
+            case Err(io.Error failure): {
+                return Result<void, str>.Err("could not replace " + hook + ": " + failure.to_str());
+            }
+        }
+    }
+    match (io.open(hook, mode: io.Mode.Write, perm: 0o755)) {
+        case Ok(io.File file): {
+            match (file.write(script.to_bytes())) {
+                case Ok(_): {
+                    return Result<void, str>.Ok;
+                }
+                case Err(io.Error failure): {
+                    return Result<void, str>.Err("could not write " + hook + ": " + failure.to_str());
+                }
+            }
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not create " + hook + ": " + failure.to_str());
+        }
+    }
+}
+
+Result<void, str> cmd_serve(str path, args.Parsed command) {
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    return HOARD_server.serve(path, command.value("listen").or(config.listen), command.integer("workers").or(16));
+}
+
+// --- repositories ------------------------------------------------------------
+
+Result<void, str> git(List<str> argv) {
+    match (proc.run(argv, is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (done.is_success()) {
+                return Result<void, str>.Ok;
+            }
+            return Result<void, str>.Err(argv.join(" ") + " failed: " + done.stderr.utf8().or("").trim());
+        }
+        case Err(proc.Error failure): {
+            return Result<void, str>.Err("could not run git: " + failure.to_str());
+        }
+    }
+}
+
+Result<void, str> add_repo(str path, HOARD_store.Config config, str name, bool is_public, bool is_adopting) {
+    if (!HOARD_store.is_valid_repo_name(name)) {
+        return Result<void, str>.Err("invalid repository name '" + name + "' (letters, digits, '.', '_', '-'; no '..', no .git suffix)");
+    }
+    if (config.repos.contains(name)) {
+        return Result<void, str>.Err("repository '" + name + "' already exists");
+    }
+    str git_directory = HOARD_store.repo_git_directory(config, path, name);
+    if (is_adopting) {
+        if (!fs.is_directory(git_directory)) {
+            return Result<void, str>.Err(git_directory + " does not exist");
+        }
+    } else {
+        if (fs.is_present(git_directory)) {
+            return Result<void, str>.Err(git_directory + " already exists on disk");
+        }
+        HOARD_store.make_dirs(HOARD_store.repo_root(config, path))?;
+        git(["git", "init", "--quiet", "--bare", "--initial-branch=main", git_directory])?;
+    }
+    // Point the repository at hoard's hooks and name it, so post-receive can
+    // find its way back here.
+    git(["git", "--git-dir", git_directory, "config", "core.hooksPath", hooks_directory(path)])?;
+    git(["git", "--git-dir", git_directory, "config", "hoard.repo", name])?;
+    List<str> readers = [];
+    List<str> writers = [];
+    config.repos.set(name, HOARD_store.Repo(is_public, readers, writers));
+    HOARD_store.save(path, config)?;
+    print(HOARD_pages.regen(git_directory, fs.join(HOARD_store.pages_root(config, path), name), name, config.base_url, true)?);
+    if (is_adopting) {
+        print("adopted repository " + name + " at " + git_directory);
+    } else {
+        print("created repository " + name + " at " + git_directory);
+    }
+    return Result<void, str>.Ok;
+}
+
+Result<void, str> cmd_regen(str path, args.Parsed command) {
+    str name = command.positional("name");
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    repo_of(config, name)?;
+    // From the hook, commit pages that already exist are kept (a commit never
+    // changes); by hand, everything is rebuilt.
+    print(HOARD_pages.regen(HOARD_store.repo_git_directory(config, path, name), fs.join(HOARD_store.pages_root(config, path), name), name, config.base_url, !command.is_flag_set("hook"))?);
+    return Result<void, str>.Ok;
+}
+
+Result<void, str> cmd_list(str path) {
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    print("users:");
+    List<str> users = config.users.keys();
+    users.sort();
+    for (str name in users) {
+        print("  " + name);
+    }
+    print("repositories:");
+    List<str> repos = config.repos.keys();
+    repos.sort();
+    for (str name in repos) {
+        HOARD_store.Repo entry = repo_of(config, name)?;
+        str shown = "private";
+        if (entry.is_public) {
+            shown = "public";
+        }
+        print("  " + name + " (" + shown + ") readers=" + entry.readers.join(",") + " writers=" + entry.writers.join(","));
+    }
+    return Result<void, str>.Ok;
+}

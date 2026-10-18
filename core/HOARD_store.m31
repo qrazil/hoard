@@ -1,0 +1,567 @@
+// The configuration file: names, loading, permissions and crash-safe saving.
+//
+// The config is one JSON document, the same schema as orogit's, so an orogit
+// install moves over by copying the file:
+//
+//     {
+//       "listen": "127.0.0.1:8789",
+//       "repo_root": "repos",
+//       "pages_root": "pages",
+//       "base_url": "https://git.example.org",
+//       "trusted_proxies": ["127.0.0.1"],
+//       "users": {"alice": {"hash": "$6$salt$..."}},
+//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}}
+//     }
+//
+// Relative paths are relative to the directory holding the config file. Keys
+// this program does not know (orogit's "oro") are kept and written back.
+
+import core.HOARD_addr;
+import encoding.json;
+import fs;
+import io;
+import os;
+
+pub type Repo {
+    pub bool is_public;
+    pub List<str> readers;
+    pub List<str> writers;
+}
+
+pub type Config {
+    pub str listen;
+    pub str repo_root;
+    pub str pages_root;
+    pub str base_url;
+    pub List<str> trusted_proxies;
+    // user name -> SHA-512-crypt hash
+    pub Map<str, str> users;
+    pub Map<str, Repo> repos;
+    // Top-level keys this program does not read, written back unchanged.
+    pub Map<str, json.Value> extra;
+}
+
+pub Config default_config() {
+    List<str> proxies = [];
+    Map<str, str> users = {};
+    Map<str, Repo> repos = {};
+    Map<str, json.Value> extra = {};
+    return Config("127.0.0.1:8789", "repos", "pages", "", proxies, users, repos, extra);
+}
+
+// --- names -------------------------------------------------------------------
+
+// Letters, digits, `.`, `_` and `-`, starting with a letter, digit or `_`, at
+// most `limit` bytes.
+bool is_simple_name(str name, int limit) {
+    if (name.size() == 0 || name.size() > limit) {
+        return false;
+    }
+    for (int index in 0 .. name.size()) {
+        int byte = name.byte_at(index);
+        bool is_alnum = (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z');
+        if (index == 0 && !is_alnum && byte != '_') {
+            return false;
+        }
+        if (!is_alnum && byte != '_' && byte != '.' && byte != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A repository name is always exactly one path segment. `..` is refused
+/// anywhere, and so is a `.git` suffix, because `/<name>.git/` is the git URL
+/// of `<name>`: a repository called `foo.git` would make `/foo.git/` mean two
+/// things.
+pub bool is_valid_repo_name(str name) {
+    return is_simple_name(name, 100) && !name.contains("..") && !name.ends_with(".git");
+}
+
+/// The same alphabet; in particular no `:`, the separator inside an HTTP
+/// Basic credential.
+pub bool is_valid_user_name(str name) {
+    return is_simple_name(name, 64);
+}
+
+// --- paths -------------------------------------------------------------------
+
+/// The current directory: `$PWD` when it names one, else `/proc/self/cwd`.
+pub str current_directory() {
+    match (os.env("PWD")) {
+        case Some(str pwd): {
+            if (pwd.starts_with("/") && fs.is_directory(pwd)) {
+                return pwd;
+            }
+        }
+        case None: {
+        }
+    }
+    match (fs.realpath(".")) {
+        case Ok(str here): {
+            return here;
+        }
+        case Err(io.Error failure): {
+            return "/";
+        }
+    }
+}
+
+/// `path` made absolute, relative paths taken against `base`.
+pub str absolute(str path, str base) {
+    if (path.starts_with("/")) {
+        return path;
+    }
+    return fs.join(base, path);
+}
+
+pub str parent_directory(str path) {
+    match (last_slash(path)) {
+        case Some(int slash): {
+            if (slash == 0) {
+                return "/";
+            }
+            return path.substr(0, slash);
+        }
+        case None: {
+            return ".";
+        }
+    }
+}
+
+Option<int> last_slash(str path) {
+    int index = path.size() - 1;
+    while (index >= 0) {
+        if (path.byte_at(index) == '/') {
+            return Option<int>.Some(index);
+        }
+        index = index - 1;
+    }
+    return Option<int>.None;
+}
+
+pub str repo_root(Config config, str config_path) {
+    return absolute(config.repo_root, parent_directory(config_path));
+}
+
+pub str pages_root(Config config, str config_path) {
+    return absolute(config.pages_root, parent_directory(config_path));
+}
+
+pub str repo_git_directory(Config config, str config_path, str name) {
+    return fs.join(repo_root(config, config_path), name + ".git");
+}
+
+// --- reading -----------------------------------------------------------------
+
+/// The text of the config, or None when it is missing or not a complete JSON
+/// object. `save` replaces the file by rename, so there is no half-written
+/// state to recover from, and a proper prefix of a JSON object never parses.
+pub Option<str> read_raw(str config_path) {
+    if (!fs.is_file(config_path)) {
+        return Option<str>.None;
+    }
+    match (io.read(config_path)) {
+        case Ok(str text): {
+            match (json.parse(text)) {
+                case Ok(json.Value value): {
+                    if (object_of(value).is_some()) {
+                        return Option<str>.Some(text);
+                    }
+                    return Option<str>.None;
+                }
+                case Err(_): {
+                    return Option<str>.None;
+                }
+            }
+        }
+        case Err(_): {
+            return Option<str>.None;
+        }
+    }
+}
+
+pub Result<Config, str> load(str config_path) {
+    match (read_raw(config_path)) {
+        case Some(str text): {
+            return parse(text);
+        }
+        case None: {
+            return Result<Config, str>.Err("no readable config at " + config_path);
+        }
+    }
+}
+
+/// The config in `text`, with missing keys filled in and entries of the wrong
+/// shape dropped, so the rest of the program never checks a level. A
+/// malformed `trusted_proxies` entry is an error rather than a silent
+/// mismatch: a proxy that stops being trusted makes every client share its
+/// address, and one attacker's failures would lock everyone out.
+pub Result<Config, str> parse(str text) {
+    Config config = default_config();
+    Map<str, json.Value> fields = {};
+    match (json.parse(text)) {
+        case Ok(json.Value value): {
+            match (object_of(value)) {
+                case Some(Map<str, json.Value> object): {
+                    fields = object;
+                }
+                case None: {
+                    return Result<Config, str>.Err("the config is not a JSON object");
+                }
+            }
+        }
+        case Err(_): {
+            return Result<Config, str>.Err("the config is not JSON");
+        }
+    }
+    for (str key in fields.keys()) {
+        json.Value value = fields.get(key).or(json.Value.Null);
+        if (key == "listen") {
+            config.listen = text_of(value, config.listen);
+        } else if (key == "repo_root") {
+            config.repo_root = text_of(value, config.repo_root);
+        } else if (key == "pages_root") {
+            config.pages_root = text_of(value, config.pages_root);
+        } else if (key == "base_url") {
+            config.base_url = text_of(value, "");
+        } else if (key == "trusted_proxies") {
+            for (json.Value item in array_of(value)) {
+                str entry = text_of(item, "");
+                if (!HOARD_addr.is_valid_entry(entry)) {
+                    return Result<Config, str>.Err("trusted_proxies entry '" + entry + "' is not an IP address or an IPv4 CIDR block");
+                }
+                config.trusted_proxies.push(entry);
+            }
+        } else if (key == "users") {
+            Map<str, json.Value> users = object_of(value).or({});
+            for (str name in users.keys()) {
+                str hash = text_of(member(users.get(name).or(json.Value.Null), "hash"), "");
+                if (is_valid_user_name(name) && hash != "") {
+                    config.users.set(name, hash);
+                }
+            }
+        } else if (key == "repos") {
+            Map<str, json.Value> repos = object_of(value).or({});
+            for (str name in repos.keys()) {
+                json.Value entry = repos.get(name).or(json.Value.Null);
+                if (is_valid_repo_name(name) && object_of(entry).is_some()) {
+                    bool is_public = is_true(member(entry, "public"));
+                    config.repos.set(name, Repo(is_public, names_of(member(entry, "readers")), names_of(member(entry, "writers"))));
+                }
+            }
+        } else {
+            config.extra.set(key, value);
+        }
+    }
+    return Result<Config, str>.Ok(config);
+}
+
+// --- reading JSON values -----------------------------------------------------
+// One arm per variant, because a `match` has no default: these are the only
+// places the config reader names a variant it does not want.
+
+str text_of(json.Value value, str fallback) {
+    match (value) {
+        case Str(str text): {
+            return text;
+        }
+        case Null: {
+            return fallback;
+        }
+        case Bool(_): {
+            return fallback;
+        }
+        case Int(_): {
+            return fallback;
+        }
+        case Float(_): {
+            return fallback;
+        }
+        case Array(_): {
+            return fallback;
+        }
+        case Object(_): {
+            return fallback;
+        }
+    }
+}
+
+bool is_true(json.Value value) {
+    match (value) {
+        case Bool(bool flag): {
+            return flag;
+        }
+        case Null: {
+            return false;
+        }
+        case Str(_): {
+            return false;
+        }
+        case Int(_): {
+            return false;
+        }
+        case Float(_): {
+            return false;
+        }
+        case Array(_): {
+            return false;
+        }
+        case Object(_): {
+            return false;
+        }
+    }
+}
+
+List<json.Value> array_of(json.Value value) {
+    List<json.Value> none = [];
+    match (value) {
+        case Array(List<json.Value> items): {
+            return items;
+        }
+        case Null: {
+            return none;
+        }
+        case Bool(_): {
+            return none;
+        }
+        case Int(_): {
+            return none;
+        }
+        case Float(_): {
+            return none;
+        }
+        case Str(_): {
+            return none;
+        }
+        case Object(_): {
+            return none;
+        }
+    }
+}
+
+Option<Map<str, json.Value>> object_of(json.Value value) {
+    match (value) {
+        case Object(Map<str, json.Value> fields): {
+            return Option<Map<str, json.Value>>.Some(fields);
+        }
+        case Null: {
+            return Option<Map<str, json.Value>>.None;
+        }
+        case Bool(_): {
+            return Option<Map<str, json.Value>>.None;
+        }
+        case Int(_): {
+            return Option<Map<str, json.Value>>.None;
+        }
+        case Float(_): {
+            return Option<Map<str, json.Value>>.None;
+        }
+        case Str(_): {
+            return Option<Map<str, json.Value>>.None;
+        }
+        case Array(_): {
+            return Option<Map<str, json.Value>>.None;
+        }
+    }
+}
+
+json.Value member(json.Value value, str key) {
+    match (object_of(value)) {
+        case Some(Map<str, json.Value> fields): {
+            return fields.get(key).or(json.Value.Null);
+        }
+        case None: {
+            return json.Value.Null;
+        }
+    }
+}
+
+// The valid user names in a JSON array, each once, in order.
+List<str> names_of(json.Value value) {
+    List<str> out = [];
+    for (json.Value item in array_of(value)) {
+        str name = text_of(item, "");
+        if (is_valid_user_name(name) && !out.contains(name)) {
+            out.push(name);
+        }
+    }
+    return out;
+}
+
+// --- permissions -------------------------------------------------------------
+
+pub bool can_read(Config config, str repo, str user) {
+    match (config.repos.get(repo)) {
+        case Some(Repo entry): {
+            if (entry.is_public) {
+                return true;
+            }
+            if (user == "" || !config.users.contains(user)) {
+                return false;
+            }
+            return entry.readers.contains(user) || entry.writers.contains(user);
+        }
+        case None: {
+            return false;
+        }
+    }
+}
+
+pub bool can_write(Config config, str repo, str user) {
+    match (config.repos.get(repo)) {
+        case Some(Repo entry): {
+            if (user == "" || !config.users.contains(user)) {
+                return false;
+            }
+            return entry.writers.contains(user);
+        }
+        case None: {
+            return false;
+        }
+    }
+}
+
+// --- saving ------------------------------------------------------------------
+
+/// The config as the JSON text `save` writes: keys sorted, two-space indent.
+pub Result<str, str> render(Config config) {
+    Map<str, json.Value> out = {};
+    for (str key in config.extra.keys()) {
+        out.set(key, config.extra.get(key).or(json.Value.Null));
+    }
+    out.set("listen", json.Value.Str(config.listen));
+    out.set("repo_root", json.Value.Str(config.repo_root));
+    out.set("pages_root", json.Value.Str(config.pages_root));
+    if (config.base_url != "") {
+        out.set("base_url", json.Value.Str(config.base_url));
+    }
+    out.set("trusted_proxies", json.Value.Array(strings(config.trusted_proxies)));
+    Map<str, json.Value> users = {};
+    for (str name in config.users.keys()) {
+        Map<str, json.Value> entry = {"hash": json.Value.Str(config.users.get(name).or(""))};
+        users.set(name, json.Value.Object(entry));
+    }
+    out.set("users", json.Value.Object(users));
+    Map<str, json.Value> repos = {};
+    for (str name in config.repos.keys()) {
+        match (config.repos.get(name)) {
+            case Some(Repo entry): {
+                Map<str, json.Value> fields = {"public": json.Value.Bool(entry.is_public), "readers": json.Value.Array(strings(entry.readers)), "writers": json.Value.Array(strings(entry.writers))};
+                repos.set(name, json.Value.Object(fields));
+            }
+            case None: {
+            }
+        }
+    }
+    out.set("repos", json.Value.Object(repos));
+    match (json.stringify(json.Value.Object(out), indent: 2)) {
+        case Ok(str text): {
+            return Result<str, str>.Ok(text + "\n");
+        }
+        case Err(json.Error failure): {
+            return Result<str, str>.Err("could not write the config: " + failure.to_str());
+        }
+    }
+}
+
+List<json.Value> strings(List<str> items) {
+    List<json.Value> out = [];
+    for (str item in items) {
+        out.push(json.Value.Str(item));
+    }
+    return out;
+}
+
+/// Write the config so that a crash at any instant leaves a complete document
+/// on disk: the new document goes to `<config>.temp`, created with mode 0600
+/// because it holds password hashes, and is then renamed over the config. A
+/// rename within one filesystem is atomic, so a reader sees the old config or
+/// the new one, never half of either. The temp file sits beside the config
+/// because a rename across filesystems is not atomic.
+pub Result<void, str> save(str config_path, Config config) {
+    str text = render(config)?;
+    str temp = config_path + ".temp";
+    if (fs.is_present(temp)) {
+        // A stray from a crash may carry other permissions; `open` keeps a
+        // file's mode, so start from nothing.
+        match (fs.remove(temp)) {
+            case Ok(_): {
+            }
+            case Err(io.Error failure): {
+                return Result<void, str>.Err("could not remove " + temp + ": " + failure.to_str());
+            }
+        }
+    }
+    match (io.open(temp, mode: io.Mode.Write, perm: 0o600)) {
+        case Ok(io.File file): {
+            match (file.write(text.to_bytes())) {
+                case Ok(int written): {
+                }
+                case Err(io.Error failure): {
+                    return Result<void, str>.Err("could not write " + temp + ": " + failure.to_str());
+                }
+            }
+            match (file.close()) {
+                case Ok(bool is_closed): {
+                }
+                case Err(io.Error failure): {
+                    return Result<void, str>.Err("could not write " + temp + ": " + failure.to_str());
+                }
+            }
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not create " + temp + ": " + failure.to_str());
+        }
+    }
+    match (fs.rename(temp, config_path)) {
+        case Ok(bool is_renamed): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not replace " + config_path + ": " + failure.to_str());
+        }
+    }
+}
+
+// --- the admin lock ----------------------------------------------------------
+
+/// Take the admin lock: create `<config>.lock` with `mkdir`, which is atomic,
+/// so two admin commands cannot read, change and save the config at once and
+/// lose one update. A lock left by a crash is reported with the path to
+/// remove, never broken silently.
+pub Result<void, str> lock(str config_path) {
+    str path = config_path + ".lock";
+    match (fs.mkdir(path)) {
+        case Ok(bool is_made): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error failure): {
+            if (fs.is_directory(path)) {
+                return Result<void, str>.Err("another admin command holds " + path + "; if none is running, remove it with: rmdir " + path);
+            }
+            return Result<void, str>.Err("could not create " + path + ": " + failure.to_str());
+        }
+    }
+}
+
+pub void unlock(str config_path) {
+    match (fs.rmdir(config_path + ".lock")) {
+        case Ok(bool is_removed): {
+        }
+        case Err(io.Error failure): {
+        }
+    }
+}
+
+/// `mkdir -p`.
+pub Result<void, str> make_dirs(str path) {
+    match (fs.makedirs(path)) {
+        case Ok(bool is_made): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not create " + path + ": " + failure.to_str());
+        }
+    }
+}

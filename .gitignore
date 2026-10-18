@@ -1,0 +1,5 @@
+.m31-deps/
+/hoard
+/dist/
+__pycache__/
+*.log

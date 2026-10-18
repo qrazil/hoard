@@ -1,0 +1,96 @@
+// Unit tests for HOARD_html and the text helpers of HOARD_pages.
+//
+// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+
+import core.HOARD_html;
+import core.HOARD_pages;
+
+type Tally {
+    int passed = 0;
+    int failed = 0;
+}
+
+void Tally.same(str name, str got, str want) {
+    if (got == want) {
+        passed = passed + 1;
+        print("ok   " + name);
+    } else {
+        failed = failed + 1;
+        print("FAIL " + name + ": got [" + got + "] want [" + want + "]");
+    }
+}
+
+void Tally.check(str name, bool is_true) {
+    if (is_true) {
+        passed = passed + 1;
+        print("ok   " + name);
+    } else {
+        failed = failed + 1;
+        print("FAIL " + name);
+    }
+}
+
+Tally tally = Tally();
+// escape
+tally.same("escape: plain", HOARD_html.escape("hello"), "hello");
+tally.same("escape: empty", HOARD_html.escape(""), "");
+tally.same("escape: all five", HOARD_html.escape("<a href=\"x\">'&'</a>"), "&lt;a href=&quot;x&quot;&gt;&#x27;&amp;&#x27;&lt;/a&gt;");
+tally.same("escape: script", HOARD_html.escape("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;");
+tally.same("escape: no double unescape", HOARD_html.escape("&amp;"), "&amp;amp;");
+tally.same("escape: non-ASCII kept", HOARD_html.escape("café <€>"), "café &lt;€&gt;");
+// document
+str index_page = HOARD_html.document("Repos <x>", "", "<p>body</p>", "");
+tally.check("document: index nav says hoard", index_page.contains("<nav><b>hoard</b></nav>"));
+tally.check("document: title escaped", index_page.contains("<title>Repos &lt;x&gt;</title>"));
+tally.check("document: doctype first", index_page.starts_with("<!doctype html>\n"));
+tally.check("document: ends with newline", index_page.ends_with("</body></html>\n"));
+str repo_page = HOARD_html.document("t", "../", "", "a<b");
+tally.check("document: repo nav escapes the name", repo_page.contains("<b>a&lt;b</b>"));
+tally.check("document: repo nav links up", repo_page.contains("<a href=\"../../\">all repositories</a>"));
+tally.check("document: repo nav log", repo_page.contains("<a href=\"../log.html\">log</a>"));
+// lossy
+bytes valid = "héllo".to_bytes();
+tally.same("lossy: valid UTF-8 unchanged", HOARD_pages.lossy(valid), "héllo");
+bytes latin = [99, 97, 102, 233, 33];
+tally.same("lossy: latin-1 byte", HOARD_pages.lossy(latin), "caf\u{FFFD}!");
+bytes stray = [0xff, 0xfe, 'a'];
+tally.same("lossy: one mark per bad byte", HOARD_pages.lossy(stray), "\u{FFFD}\u{FFFD}a");
+bytes cut = [0xe2, 0x82];
+tally.same("lossy: truncated sequence", HOARD_pages.lossy(cut), "\u{FFFD}\u{FFFD}");
+bytes mixed = [0xe2, 0x82, 0xac, 0x80, 'z'];
+tally.same("lossy: valid run kept, continuation replaced", HOARD_pages.lossy(mixed), "€\u{FFFD}z");
+bytes empty = [];
+tally.same("lossy: empty", HOARD_pages.lossy(empty), "");
+// is_binary
+tally.check("is_binary: text", !HOARD_pages.is_binary("plain text\n".to_bytes()));
+tally.check("is_binary: empty", !HOARD_pages.is_binary(empty));
+bytes with_nul = [104, 0, 105];
+tally.check("is_binary: NUL", HOARD_pages.is_binary(with_nul));
+tally.check("is_binary: not UTF-8", HOARD_pages.is_binary(latin));
+bytes late_nul = [0x61; 9000];
+late_nul[8500] = 0;
+tally.check("is_binary: NUL past the sniff is text", !HOARD_pages.is_binary(late_nul));
+late_nul[7999] = 0;
+tally.check("is_binary: NUL at the last sniffed byte", HOARD_pages.is_binary(late_nul));
+// file_href and file_disk_path
+List<str> top = ["README.md"];
+tally.same("file_href: top level", HOARD_pages.file_href(top), "file/README.md.html");
+tally.same("file_disk_path: top level", HOARD_pages.file_disk_path(top), "file/README.md.html");
+List<str> nested = ["a", "b", "c.txt"];
+tally.same("file_href: nested", HOARD_pages.file_href(nested), "file/a.d/b.d/c.txt.html");
+tally.same("file_disk_path: nested", HOARD_pages.file_disk_path(nested), "file/a.d/b.d/c.txt.html");
+List<str> hostile = ["<x> \"q\"", "it's&.txt"];
+tally.same("file_href: quoted and escaped", HOARD_pages.file_href(hostile), "file/%3Cx%3E%20%22q%22.d/it%27s%26.txt.html");
+tally.same("file_disk_path: raw names", HOARD_pages.file_disk_path(hostile), "file/<x> \"q\".d/it's&.txt.html");
+List<str> unicode = ["é.txt"];
+tally.same("file_href: UTF-8 percent-encoded", HOARD_pages.file_href(unicode), "file/%C3%A9.txt.html");
+List<str> clash_file = ["x.html"];
+List<str> clash_directory = ["x", "y"];
+tally.check("file_disk_path: a file x.html and a directory x never collide", HOARD_pages.file_disk_path(clash_file) != HOARD_pages.file_disk_path(clash_directory) && HOARD_pages.file_disk_path(clash_directory) == "file/x.d/y.html");
+// diff_markup
+str diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old <b>\n+new & 'x'\n context";
+str want = "<b>diff --git a/f b/f</b>\n<b>--- a/f</b>\n<b>+++ b/f</b>\n<span class=\"h\">@@ -1 +1 @@</span>\n<span class=\"d\">-old &lt;b&gt;</span>\n<span class=\"a\">+new &amp; &#x27;x&#x27;</span>\n context";
+tally.same("diff_markup: classes and escaping", HOARD_pages.diff_markup(diff), want);
+tally.same("diff_markup: empty", HOARD_pages.diff_markup(""), "");
+tally.same("diff_markup: stat line plain", HOARD_pages.diff_markup(" f | 2 +-"), " f | 2 +-");
+print(str(tally.passed) + " passed, " + str(tally.failed) + " failed");

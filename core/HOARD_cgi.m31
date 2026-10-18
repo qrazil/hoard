@@ -1,0 +1,464 @@
+// Git smart HTTP, by running `git http-backend` as a CGI program with
+// streamed pipes.
+//
+// The request body is copied into the backend's stdin a piece at a time and
+// its stdout is copied to the client the same way, so a clone or push of any
+// size moves through in constant memory. The backend's stderr is moved to a
+// thread of its own that logs it, so a chatty backend can never fill a pipe
+// nobody reads.
+//
+// The body is fed in full before the answer is read. That cannot deadlock on
+// git's stateless RPC, where upload-pack and receive-pack read their whole
+// request before they write anything large; orogit relies on the same
+// property.
+
+import io;
+import net;
+import net.http;
+import os;
+import proc;
+
+/// What a connection does after a response: carry another request, or close.
+pub enum Next {
+    KeepAlive;
+    Close;
+}
+
+/// `KeepAlive` when `is_reusable`.
+pub Next next_of(bool is_reusable) {
+    if (is_reusable) {
+        return Next.KeepAlive;
+    }
+    return Next.Close;
+}
+
+pub const str READ = "read";
+pub const str WRITE = "write";
+const int MAX_CGI_HEAD = 65536;
+const int PIECE = 65536;
+
+// --- which paths reach the backend -------------------------------------------
+
+bool is_hex_run(str text, int from, int count) {
+    if (from + count > text.size()) {
+        return false;
+    }
+    for (int index in from .. from + count) {
+        int byte = text.byte_at(index);
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Every path below `/<repo>.git` that `git http-backend` answers. Anything
+/// else is a 404, before a process is started.
+pub bool is_backend_path(str rest) {
+    if (rest == "/HEAD" || rest == "/info/refs" || rest == "/git-upload-pack" || rest == "/git-receive-pack") {
+        return true;
+    }
+    if (rest == "/objects/info/alternates" || rest == "/objects/info/http-alternates" || rest == "/objects/info/packs") {
+        return true;
+    }
+    // /objects/xx/<38 or 62 hex>
+    if (rest.starts_with("/objects/") && rest.size() > 12 && rest.byte_at(11) == '/' && is_hex_run(rest, 9, 2)) {
+        int tail = rest.size() - 12;
+        return (tail == 38 || tail == 62) && is_hex_run(rest, 12, tail);
+    }
+    // /objects/pack/pack-<40 or 64 hex>.(pack|idx)
+    str prefix = "/objects/pack/pack-";
+    if (rest.starts_with(prefix)) {
+        str name = rest.substr(prefix.size(), rest.size());
+        int digits = 0;
+        if (name.ends_with(".pack")) {
+            digits = name.size() - 5;
+        } else if (name.ends_with(".idx")) {
+            digits = name.size() - 4;
+        } else {
+            return false;
+        }
+        return (digits == 40 || digits == 64) && is_hex_run(name, 0, digits);
+    }
+    return false;
+}
+
+/// The decoded value of `name` in a query string, or None.
+pub Option<str> query_value(str query, str name) {
+    for (str pair in query.split("&")) {
+        match (pair.index_of("=")) {
+            case Some(int equals): {
+                if (pair.substr(0, equals) == name) {
+                    match (http.unquote(pair.substr(equals + 1, pair.size()), should_decode_plus: true)) {
+                        case Ok(str value): {
+                            return Option<str>.Some(value);
+                        }
+                        case Err(_): {
+                            return Option<str>.None;
+                        }
+                    }
+                }
+            }
+            case None: {
+            }
+        }
+    }
+    return Option<str>.None;
+}
+
+/// What `rest` (the path after `/<repo>.git`) needs: READ, WRITE, or "" for a
+/// path the backend does not serve.
+///
+/// Push is recognised in both places it can appear, and each is checked on
+/// its own: the ref advertisement `GET info/refs?service=git-receive-pack` and
+/// the pack upload `POST git-receive-pack`. The service checked here is the
+/// service that goes into QUERY_STRING, so it is the one the backend acts on.
+pub str access_needed(str rest, str query) {
+    if (!is_backend_path(rest)) {
+        return "";
+    }
+    if (rest == "/git-receive-pack") {
+        return WRITE;
+    }
+    if (rest == "/info/refs") {
+        match (query_value(query, "service")) {
+            case Some(str service): {
+                if (service == "git-receive-pack") {
+                    return WRITE;
+                }
+                if (service != "git-upload-pack") {
+                    return "";
+                }
+            }
+            case None: {
+            }
+        }
+    }
+    return READ;
+}
+
+// What a client may put in `Git-Protocol` (e.g. "version=2").
+bool is_git_protocol(str value) {
+    if (value.size() == 0 || value.size() > 100) {
+        return false;
+    }
+    for (int index in 0 .. value.size()) {
+        int byte = value.byte_at(index);
+        bool is_alnum = (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z');
+        if (!is_alnum && byte != '=' && byte != ':' && byte != '.' && byte != '_' && byte != ' ' && byte != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// --- the CGI header block ----------------------------------------------------
+
+/// The status and headers of a CGI header block.
+pub type CgiHead {
+    pub int status;
+    pub List<str> names;
+    pub List<str> values;
+}
+
+/// The `Status:` and headers of a CGI header block ending in a blank line, or
+/// None when it is malformed. Headers that describe framing on the backend's
+/// side of the pipe are dropped: the server frames the response itself.
+pub Option<CgiHead> parse_cgi_head(bytes head) {
+    List<str> names = [];
+    List<str> values = [];
+    CgiHead out = CgiHead(200, names, values);
+    match (head.utf8()) {
+        case Some(str text): {
+            if (!text.ends_with("\r\n\r\n")) {
+                return Option<CgiHead>.None;
+            }
+            for (str line in text.substr(0, text.size() - 4).split("\r\n")) {
+                match (line.index_of(":")) {
+                    case Some(int colon): {
+                        if (colon < 1) {
+                            return Option<CgiHead>.None;
+                        }
+                        str name = line.substr(0, colon).trim().to_lower();
+                        str value = line.substr(colon + 1, line.size()).trim();
+                        if (name == "status") {
+                            str code = value;
+                            match (value.index_of(" ")) {
+                                case Some(int space): {
+                                    code = value.substr(0, space);
+                                }
+                                case None: {
+                                }
+                            }
+                            if (code.size() != 3) {
+                                return Option<CgiHead>.None;
+                            }
+                            match (code.parse_int()) {
+                                case Some(int status): {
+                                    out.status = status;
+                                }
+                                case None: {
+                                    return Option<CgiHead>.None;
+                                }
+                            }
+                        } else if (name != "content-length" && name != "transfer-encoding" && name != "connection") {
+                            out.names.push(name);
+                            out.values.push(value);
+                        }
+                    }
+                    case None: {
+                        return Option<CgiHead>.None;
+                    }
+                }
+            }
+            return Option<CgiHead>.Some(out);
+        }
+        case None: {
+            return Option<CgiHead>.None;
+        }
+    }
+}
+
+// --- running the backend -----------------------------------------------------
+
+/// Everything `run` needs besides the connection and the request.
+pub type Call {
+    pub str repo;
+    pub str rest;
+    pub str repo_root;
+    pub str user;
+    pub str address;
+    pub str path_env;
+}
+
+void log_line(str text) {
+    io.eprint("hoard: " + text + "\n");
+}
+
+// The stderr thread: log what the backend says, a line at a time.
+void log_stderr(proc.Pipe stream, str label) {
+    while (true) {
+        match (io.read_line_of(stream, 8192)) {
+            case Ok(Option<str> maybe): {
+                match (maybe) {
+                    case Some(str line): {
+                        log_line(label + ": " + line);
+                    }
+                    case None: {
+                        return;
+                    }
+                }
+            }
+            case Err(_): {
+                return;
+            }
+        }
+    }
+}
+
+// A plain-text answer, written in one piece, after which the connection
+// closes.
+Next refuse(net.Conn connection, http.Request request, int status, str message) {
+    http.Response reply = http.text_response(message + "\n", status: status);
+    match (http.write_response(connection, request, reply, false)) {
+        case Ok: {
+        }
+        case Err(_): {
+        }
+    }
+    return Next.Close;
+}
+
+/// Run the backend for `incoming` and stream its answer to `conn`. The caller
+/// has already decided the requester may do what `call.rest` asks. Answers
+/// what the connection does next.
+pub Next run(net.Conn connection, http.RequestStream incoming, Call call) {
+    http.Request request = incoming.request();
+    str label = request.method() + " /" + call.repo + ".git" + call.rest;
+    str query = "";
+    if (call.rest == "/info/refs") {
+        match (query_value(request.query(), "service")) {
+            case Some(str service): {
+                query = "service=" + service;
+            }
+            case None: {
+            }
+        }
+    }
+    Map<str, str> env = {"PATH": call.path_env, "GATEWAY_INTERFACE": "CGI/1.1", "SERVER_PROTOCOL": "HTTP/1.1", "REQUEST_METHOD": request.method(), "GIT_PROJECT_ROOT": call.repo_root, "PATH_INFO": "/" + call.repo + ".git" + call.rest, "QUERY_STRING": query, "REMOTE_ADDR": call.address};
+    // Read access to this repository has been checked, and this variable is
+    // set only on this path: it tells the backend to serve the repository
+    // without a `git-daemon-export-ok` file.
+    env.set("GIT_HTTP_EXPORT_ALL", "1");
+    copy_header(request, "content-type", env, "CONTENT_TYPE");
+    copy_header(request, "content-length", env, "CONTENT_LENGTH");
+    // git gzips request bodies; the backend inflates them when told.
+    copy_header(request, "content-encoding", env, "HTTP_CONTENT_ENCODING");
+    match (request.header("git-protocol")) {
+        case Some(str protocol): {
+            if (is_git_protocol(protocol)) {
+                env.set("HTTP_GIT_PROTOCOL", protocol);
+            }
+        }
+        case None: {
+        }
+    }
+    if (call.user != "") {
+        // Also what makes the backend allow receive-pack at all.
+        env.set("REMOTE_USER", call.user);
+    }
+    List<str> argv = ["git", "http-backend"];
+    match (proc.start(argv, cwd: call.repo_root, env: Option<Map<str, str>>.Some(env))) {
+        case Ok(proc.Proc child): {
+            spawn log_stderr(child.take_stderr(), clone(label));
+            return converse(connection, incoming, child, label);
+        }
+        case Err(proc.Error failure): {
+            log_line(label + ": could not start git http-backend: " + failure.to_str());
+            return refuse(connection, request, 502, "bad gateway");
+        }
+    }
+}
+
+void copy_header(http.Request request, str name, Map<str, str> env, str variable) {
+    match (request.header(name)) {
+        case Some(str value): {
+            env.set(variable, value);
+        }
+        case None: {
+        }
+    }
+}
+
+// Feed the body, read the CGI head, stream the rest.
+Next converse(net.Conn connection, http.RequestStream incoming, proc.Proc child, str label) {
+    http.Request request = incoming.request();
+    proc.Pipe input = child.take_stdin();
+    bool is_fed = true;
+    bool is_body_read = true;
+    while (is_fed) {
+        match (incoming.read(PIECE)) {
+            case Ok(bytes piece): {
+                if (piece.size() == 0) {
+                    is_fed = false;
+                } else {
+                    match (input.write(piece)) {
+                        case Ok(_): {
+                        }
+                        case Err(_): {
+                            // The backend stopped reading: that is its answer
+                            // (a refusal), and it is read below. The rest of the
+                            // body is unread, so the connection cannot be reused.
+                            is_fed = false;
+                            is_body_read = false;
+                        }
+                    }
+                }
+            }
+            case Err(http.Error failure): {
+                log_line(label + ": request body failed: " + failure.to_str());
+                return refuse(connection, request, 400, "request body could not be read");
+            }
+        }
+    }
+    match (input.close()) {
+        case Ok(_): {
+        }
+        case Err(_): {
+        }
+    }
+    proc.Pipe output = child.take_stdout();
+    bytes head = [];
+    match (output.read_until("\r\n\r\n".to_bytes(), MAX_CGI_HEAD)) {
+        case Ok(bytes got): {
+            head = got;
+        }
+        case Err(_): {
+        }
+    }
+    CgiHead cgi = CgiHead(0, [], []);
+    match (parse_cgi_head(head)) {
+        case Some(CgiHead parsed): {
+            cgi = parsed;
+        }
+        case None: {
+            drain(output);
+            log_line(label + ": backend sent no CGI header " + finish(child));
+            return refuse(connection, request, 502, "bad gateway");
+        }
+    }
+    http.Response reply = http.response(cgi.status);
+    for (int index in 0 .. cgi.names.size()) {
+        reply.set(cgi.names[index], cgi.values[index]);
+    }
+    bool is_keep_alive = is_body_read && incoming.is_finished() && http.should_keep_alive(request, reply);
+    match (http.start_response(connection, request, reply, is_keep_alive)) {
+        case Ok(http.BodyWriter writer): {
+            while (true) {
+                match (output.read(PIECE)) {
+                    case Ok(bytes piece): {
+                        if (piece.size() == 0) {
+                            match (writer.finish()) {
+                                case Ok: {
+                                }
+                                case Err(_): {
+                                    return Next.Close;
+                                }
+                            }
+                            str status = finish(child);
+                            if (status != "") {
+                                log_line(label + ": git http-backend " + status);
+                            }
+                            return next_of(writer.is_keep_alive());
+                        }
+                        match (writer.write(piece)) {
+                            case Ok: {
+                            }
+                            case Err(_): {
+                                // The client went away. Dropping the child
+                                // kills and reaps the backend.
+                                return Next.Close;
+                            }
+                        }
+                    }
+                    case Err(_): {
+                        return Next.Close;
+                    }
+                }
+            }
+        }
+        case Err(_): {
+            return Next.Close;
+        }
+    }
+}
+
+void drain(proc.Pipe output) {
+    while (true) {
+        match (output.read(PIECE)) {
+            case Ok(bytes piece): {
+                if (piece.size() == 0) {
+                    return;
+                }
+            }
+            case Err(_): {
+                return;
+            }
+        }
+    }
+}
+
+// Reap the backend; "" for a clean exit, else how it ended.
+str finish(proc.Proc child) {
+    match (child.wait()) {
+        case Ok(os.ExitStatus status): {
+            if (status.is_success()) {
+                return "";
+            }
+            return status.to_str();
+        }
+        case Err(proc.Error failure): {
+            return failure.to_str();
+        }
+    }
+}

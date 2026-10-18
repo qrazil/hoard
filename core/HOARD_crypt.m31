@@ -1,0 +1,434 @@
+// SHA-512-crypt: the `$6$` password hashes of glibc's crypt(3) and
+// `openssl passwd -6`, which is the form hoard's config stores them in.
+//
+// API
+// ---
+//   HOARD_crypt.password_problem(password)            -> str, "" or why it is refused
+//   HOARD_crypt.hash_password(password)               -> Result<str, str>, a new `$6$` hash
+//   HOARD_crypt.is_password_correct(password, stored) -> bool
+//   HOARD_crypt.is_ct_equal(left, right)              -> bool, in constant time
+//
+// The algorithm is Ulrich Drepper's "Unix crypt using SHA-256 and SHA-512"
+// (https://www.akkadia.org/drepper/SHA-crypt.txt), step for step, over a
+// SHA-512 of its own at the bottom of this file (see there for why not
+// `lib/crypto/sha512`). The step numbers in the comments below are the
+// specification's. orogit ran `openssl passwd -6` in a subprocess for this;
+// doing it in-process means no password ever travels over a pipe, and the
+// tests check the result against `openssl passwd -6` and the specification's
+// own vectors.
+//
+// A new hash uses 16 salt characters from the operating system's random
+// source (`random.system()`) and the default 5000 rounds, written without a
+// `rounds=` field, exactly as `openssl passwd -6` writes it. A stored hash
+// may carry `rounds=N$`; N is clamped to 1000 .. 999999999 as the
+// specification says, so a hash in the config costs whatever its author
+// chose -- the config is trusted, the password is not.
+//
+// The final comparison is constant time (`is_ct_equal`), so how long a wrong
+// password takes does not say how much of the hash it got right.
+
+import random;
+
+const str MAGIC = "$6$";
+const str ROUNDS_FIELD = "rounds=";
+const str ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const int SALT_MAX = 16;
+const int ROUNDS_DEFAULT = 5000;
+const int ROUNDS_MIN = 1000;
+const int ROUNDS_MAX = 999_999_999;
+const int PASSWORD_MAX = 1024;
+const int ENCODED_SIZE = 86;
+const int DIGEST_SIZE = 64;
+
+// Step 22e: the digest octets that make each group of four characters, as
+// (#3, #2, #1) -- the first character holds the low six bits of #1. The
+// 22nd group is octet 63 alone, two characters, written out in `encode`.
+const Array<int> GROUPS = [
+    0, 21, 42, 22, 43, 1, 44, 2, 23, 3, 24, 45, 25, 46, 4, 47, 5, 26, 6, 27, 48,
+    28, 49, 7, 50, 8, 29, 9, 30, 51, 31, 52, 10, 53, 11, 32, 12, 33, 54, 34, 55,
+    13, 56, 14, 35, 15, 36, 57, 37, 58, 16, 59, 17, 38, 18, 39, 60, 40, 61, 19,
+    62, 20, 41
+];
+
+// What a stored hash says: the salt, the rounds and the 86 encoded characters.
+type Setting {
+    bytes salt;
+    int rounds;
+    str encoded;
+}
+
+/// Why `password` cannot be used, or "" when it can: it must not be empty,
+/// must not hold a line break or NUL (it is read one line from stdin), and
+/// must be at most 1024 bytes.
+pub str password_problem(str password) {
+    if (password.size() == 0) {
+        return "the password is empty";
+    }
+    if (password.contains("\n") || password.contains("\r") || password.contains("\0")) {
+        return "the password contains a line break or a NUL byte";
+    }
+    if (password.size() > PASSWORD_MAX) {
+        return "the password is longer than " + PASSWORD_MAX.to_str() + " bytes";
+    }
+    return "";
+}
+
+/// A new `$6$<salt>$<hash>` for `password`: a 16-character random salt and
+/// the default 5000 rounds. `Err` holds `password_problem`'s reason.
+pub Result<str, str> hash_password(str password) {
+    str problem = password_problem(password);
+    if (problem != "") {
+        return Result<str, str>.Err(problem);
+    }
+    bytes octets = random.system().octets(SALT_MAX);
+    bytes salt = [];
+    // 64 divides 256, so the low six bits of a uniform octet are uniform.
+    for (int octet in octets) {
+        salt.push(ALPHABET.byte_at(octet & 63));
+    }
+    str encoded = sha512_crypt(password.to_bytes(), salt, ROUNDS_DEFAULT);
+    match (salt.utf8()) {
+        case Some(str salt_text): {
+            return Result<str, str>.Ok(MAGIC + salt_text + "$" + encoded);
+        }
+        case None: {
+            trap("HOARD_crypt: a salt of base-64 characters is not text");
+        }
+    }
+}
+
+/// Whether `password` matches `stored`, a `$6$[rounds=N$]<salt>$<hash>`
+/// with a salt of 1 to 16 characters. A malformed `stored`, or a password
+/// `password_problem` refuses, is `false`.
+pub bool is_password_correct(str password, str stored) {
+    if (password_problem(password) != "") {
+        return false;
+    }
+    match (parse(stored)) {
+        case Some(Setting setting): {
+            str encoded = sha512_crypt(password.to_bytes(), setting.salt, setting.rounds);
+            return is_ct_equal(setting.encoded.to_bytes(), encoded.to_bytes());
+        }
+        case None: {
+            return false;
+        }
+    }
+}
+
+/// Whether `left` and `right` hold the same octets, in a time that depends
+/// only on `left.size()`: every octet of `left` is compared, whatever
+/// `right` holds and wherever the two first differ.
+pub bool is_ct_equal(bytes left, bytes right) {
+    int difference = left.size() ^ right.size();
+    // Unequal sizes are already a difference; `left` against itself keeps
+    // the loop the same length and in bounds.
+    bytes other = left;
+    if (difference == 0) {
+        other = right;
+    }
+    for (int index in 0 .. left.size()) {
+        difference = difference | (left[index] ^ other[index]);
+    }
+    return difference == 0;
+}
+
+// The salt, rounds and encoded hash of a stored `$6$` hash, or None.
+Option<Setting> parse(str stored) {
+    if (!stored.starts_with(MAGIC)) {
+        return Option<Setting>.None;
+    }
+    str rest = stored.substr(MAGIC.size(), stored.size());
+    int rounds = ROUNDS_DEFAULT;
+    if (rest.starts_with(ROUNDS_FIELD)) {
+        // As the specification's strtoul: a field that is not digits up to
+        // a '$' is not a rounds field, and is read as the salt instead.
+        match (rest.index_of("$")) {
+            case Some(int end): {
+                Option<int> count = parse_rounds(rest.substr(ROUNDS_FIELD.size(), end));
+                if (count.is_some()) {
+                    rounds = count.or(ROUNDS_DEFAULT);
+                    rest = rest.substr(end + 1, rest.size());
+                }
+            }
+            case None: {
+                return Option<Setting>.None;
+            }
+        }
+    }
+    match (rest.index_of("$")) {
+        case Some(int end): {
+            if (end == 0 || end > SALT_MAX) {
+                return Option<Setting>.None;
+            }
+            str encoded = rest.substr(end + 1, rest.size());
+            if (encoded.size() != ENCODED_SIZE) {
+                return Option<Setting>.None;
+            }
+            return Option<Setting>.Some(Setting(rest.substr(0, end).to_bytes(), rounds, encoded));
+        }
+        case None: {
+            return Option<Setting>.None;
+        }
+    }
+}
+
+// The decimal `digits` clamped to ROUNDS_MIN .. ROUNDS_MAX, or None unless
+// they are one or more ASCII digits. A value past ROUNDS_MAX saturates, as
+// strtoul's does, rather than overflowing.
+Option<int> parse_rounds(str digits) {
+    if (digits.size() == 0) {
+        return Option<int>.None;
+    }
+    int value = 0;
+    for (int index in 0 .. digits.size()) {
+        int digit = digits.byte_at(index) - '0';
+        if (digit < 0 || digit > 9) {
+            return Option<int>.None;
+        }
+        value = value * 10 + digit;
+        if (value > ROUNDS_MAX) {
+            value = ROUNDS_MAX;
+        }
+    }
+    if (value < ROUNDS_MIN) {
+        value = ROUNDS_MIN;
+    }
+    return Option<int>.Some(value);
+}
+
+// Steps 1-22e: the 86 encoded characters for `password` under `salt` (at
+// most 16 octets) and `rounds`.
+str sha512_crypt(bytes password, bytes salt, int rounds) {
+    int password_size = password.size();
+    Sha512 hasher = Sha512();
+    // Steps 4-8: digest B.
+    hasher.add(password);
+    hasher.add(salt);
+    hasher.add(password);
+    bytes alternate_digest = hasher.finish();
+    // Steps 1-3 and 9-12: digest A.
+    hasher.add(password);
+    hasher.add(salt);
+    hasher.add(stretch(alternate_digest, password_size));
+    int length_bits = password_size;
+    while (length_bits > 0) {
+        if ((length_bits & 1) != 0) {
+            hasher.add(alternate_digest);
+        } else {
+            hasher.add(password);
+        }
+        length_bits = length_bits >> 1;
+    }
+    bytes digest = hasher.finish();
+    // Steps 13-16: the byte sequence P.
+    for (int repeat in 0 .. password_size) {
+        hasher.add(password);
+    }
+    bytes password_sequence = stretch(hasher.finish(), password_size);
+    // Steps 17-20: the byte sequence S.
+    for (int repeat in 0 .. 16 + digest[0]) {
+        hasher.add(salt);
+    }
+    bytes salt_sequence = stretch(hasher.finish(), salt.size());
+    // Step 21: the rounds, each one digest C.
+    for (int round in 0 .. rounds) {
+        bool is_odd = round % 2 == 1;
+        if (is_odd) {
+            hasher.add(password_sequence);
+        } else {
+            hasher.add(digest);
+        }
+        if (round % 3 != 0) {
+            hasher.add(salt_sequence);
+        }
+        if (round % 7 != 0) {
+            hasher.add(password_sequence);
+        }
+        if (is_odd) {
+            hasher.add(digest);
+        } else {
+            hasher.add(password_sequence);
+        }
+        digest = hasher.finish();
+    }
+    return encode(digest);
+}
+
+// `digest` repeated and cut to `size` octets (steps 9-10, 16 and 20).
+bytes stretch(bytes digest, int size) {
+    bytes out = [];
+    while (out.size() + DIGEST_SIZE <= size) {
+        out.extend(digest);
+    }
+    out.extend(digest.substr(0, size - out.size()));
+    return out;
+}
+
+// Step 22e: the 64 digest octets as 86 characters of the crypt alphabet,
+// in the specification's octet order.
+str encode(bytes digest) {
+    List<int> characters = [];
+    for (int group in 0 .. 21) {
+        int high = digest[GROUPS[group * 3]];
+        int middle = digest[GROUPS[group * 3 + 1]];
+        int low = digest[GROUPS[group * 3 + 2]];
+        append_base64(characters, (high << 16) | (middle << 8) | low, 4);
+    }
+    append_base64(characters, digest[63], 2);
+    return str.from_chars(characters);
+}
+
+// The low `count` six-bit pieces of `value`, lowest first.
+void append_base64(List<int> characters, int value, int count) {
+    int rest = value;
+    for (int piece in 0 .. count) {
+        characters.push(ALPHABET.byte_at(rest & 63));
+        rest = rest >> 6;
+    }
+}
+
+// --- SHA-512 -----------------------------------------------------------------
+//
+// FIPS 180-4 over native 64-bit `int`s with `wrapping_add`, rather than
+// `lib/crypto/sha512`: that one keeps each word as a `Word64` object of two
+// 32-bit halves, allocated per operation, which made a 5000-round verify take
+// about 650 ms. Here the words are plain ints and nothing is allocated per
+// block, which puts it in the tens of milliseconds. The reason the stdlib
+// split the words -- `>>` on a negative int branched on its sign -- is gone:
+// `rt_ishr` in runtime/rt.h is branchless now, so `shr` below is constant time.
+//
+// The message is buffered whole and hashed in `finish`: every digest this
+// module takes is of a few kilobytes at most, except step 14's, which for
+// the longest password allowed is 1024 * 1024 octets.
+
+// FIPS 180-4 §5.3.5, the initial chaining values.
+const Array<int> H512 = [
+    0x6a09_e667_f3bc_c908, 0xbb67_ae85_84ca_a73b, 0x3c6e_f372_fe94_f82b, 0xa54f_f53a_5f1d_36f1,
+    0x510e_527f_ade6_82d1, 0x9b05_688c_2b3e_6c1f, 0x1f83_d9ab_fb41_bd6b, 0x5be0_cd19_137e_2179
+];
+
+// FIPS 180-4 §4.2.3, the round constants (copied from lib/crypto/sha512).
+const Array<int> K512 = [
+    0x428a_2f98_d728_ae22, 0x7137_4491_23ef_65cd, 0xb5c0_fbcf_ec4d_3b2f, 0xe9b5_dba5_8189_dbbc,
+    0x3956_c25b_f348_b538, 0x59f1_11f1_b605_d019, 0x923f_82a4_af19_4f9b, 0xab1c_5ed5_da6d_8118,
+    0xd807_aa98_a303_0242, 0x1283_5b01_4570_6fbe, 0x2431_85be_4ee4_b28c, 0x550c_7dc3_d5ff_b4e2,
+    0x72be_5d74_f27b_896f, 0x80de_b1fe_3b16_96b1, 0x9bdc_06a7_25c7_1235, 0xc19b_f174_cf69_2694,
+    0xe49b_69c1_9ef1_4ad2, 0xefbe_4786_384f_25e3, 0x0fc1_9dc6_8b8c_d5b5, 0x240c_a1cc_77ac_9c65,
+    0x2de9_2c6f_592b_0275, 0x4a74_84aa_6ea6_e483, 0x5cb0_a9dc_bd41_fbd4, 0x76f9_88da_8311_53b5,
+    0x983e_5152_ee66_dfab, 0xa831_c66d_2db4_3210, 0xb003_27c8_98fb_213f, 0xbf59_7fc7_beef_0ee4,
+    0xc6e0_0bf3_3da8_8fc2, 0xd5a7_9147_930a_a725, 0x06ca_6351_e003_826f, 0x1429_2967_0a0e_6e70,
+    0x27b7_0a85_46d2_2ffc, 0x2e1b_2138_5c26_c926, 0x4d2c_6dfc_5ac4_2aed, 0x5338_0d13_9d95_b3df,
+    0x650a_7354_8baf_63de, 0x766a_0abb_3c77_b2a8, 0x81c2_c92e_47ed_aee6, 0x9272_2c85_1482_353b,
+    0xa2bf_e8a1_4cf1_0364, 0xa81a_664b_bc42_3001, 0xc24b_8b70_d0f8_9791, 0xc76c_51a3_0654_be30,
+    0xd192_e819_d6ef_5218, 0xd699_0624_5565_a910, 0xf40e_3585_5771_202a, 0x106a_a070_32bb_d1b8,
+    0x19a4_c116_b8d2_d0c8, 0x1e37_6c08_5141_ab53, 0x2748_774c_df8e_eb99, 0x34b0_bcb5_e19b_48a8,
+    0x391c_0cb3_c5c9_5a63, 0x4ed8_aa4a_e341_8acb, 0x5b9c_ca4f_7763_e373, 0x682e_6ff3_d6b2_b8a3,
+    0x748f_82ee_5def_b2fc, 0x78a5_636f_4317_2f60, 0x84c8_7814_a1f0_ab72, 0x8cc7_0208_1a64_39ec,
+    0x90be_fffa_2363_1e28, 0xa450_6ceb_de82_bde9, 0xbef9_a3f7_b2c6_7915, 0xc671_78f2_e372_532b,
+    0xca27_3ece_ea26_619c, 0xd186_b8c7_21c0_c207, 0xeada_7dd6_cde0_eb1e, 0xf57d_4f7f_ee6e_d178,
+    0x06f0_67aa_7217_6fba, 0x0a63_7dc5_a2c8_98a6, 0x113f_9804_bef9_0dae, 0x1b71_0b35_131c_471b,
+    0x28db_77f5_2304_7d84, 0x32ca_ab7b_40c7_2493, 0x3c9e_be0a_15c9_bebc, 0x431d_67c4_9c10_0d4c,
+    0x4cc5_d4be_cb3e_42b6, 0x597f_299c_fc65_7e2a, 0x5fcb_6fab_3ad6_faec, 0x6c44_198c_4a47_5817
+];
+
+// A SHA-512 that is used again after each `finish`.
+type Sha512 {
+    bytes message = [];
+    Array<int> state = [0; 8];
+    Array<int> schedule = [0; 80];
+}
+
+void Sha512.add(bytes data) {
+    message.extend(data);
+}
+
+// The digest of everything added since the last `finish`, which empties it.
+bytes Sha512.finish() {
+    int bit_count = message.size() * 8;
+    message.push(0x80);
+    while (message.size() % 128 != 112) {
+        message.push(0);
+    }
+    // The 128-bit length: its top 64 bits are always zero here.
+    for (int zero_index in 0 .. 8) {
+        message.push(0);
+    }
+    for (int shift_index in 0 .. 8) {
+        message.push((bit_count >> (56 - shift_index * 8)) & 0xFF);
+    }
+    for (int index in 0 .. 8) {
+        state[index] = H512[index];
+    }
+    for (int block_index in 0 .. message.size() / 128) {
+        compress(block_index * 128);
+    }
+    message.clear();
+    bytes out = [];
+    for (int word in state) {
+        for (int shift_index in 0 .. 8) {
+            out.push((word >> (56 - shift_index * 8)) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// One 128-octet block of `message`, from `offset`.
+void Sha512.compress(int offset) {
+    for (int index in 0 .. 16) {
+        int word = 0;
+        for (int octet_index in 0 .. 8) {
+            word = (word << 8) | message[offset + index * 8 + octet_index];
+        }
+        schedule[index] = word;
+    }
+    for (int index in 16 .. 80) {
+        int early = schedule[index - 15];
+        int late = schedule[index - 2];
+        int small_sigma_0 = rotr(early, 1) ^ rotr(early, 8) ^ shr(early, 7);
+        int small_sigma_1 = rotr(late, 19) ^ rotr(late, 61) ^ shr(late, 6);
+        schedule[index] = schedule[index - 16].wrapping_add(small_sigma_0).wrapping_add(schedule[index - 7]).wrapping_add(small_sigma_1);
+    }
+    int working_a = state[0];
+    int working_b = state[1];
+    int working_c = state[2];
+    int working_d = state[3];
+    int working_e = state[4];
+    int working_f = state[5];
+    int working_g = state[6];
+    int working_h = state[7];
+    for (int index in 0 .. 80) {
+        int big_sigma_1 = rotr(working_e, 14) ^ rotr(working_e, 18) ^ rotr(working_e, 41);
+        int choose = (working_e & working_f) ^ (~working_e & working_g);
+        int temp1 = working_h.wrapping_add(big_sigma_1).wrapping_add(choose).wrapping_add(K512[index]).wrapping_add(schedule[index]);
+        int big_sigma_0 = rotr(working_a, 28) ^ rotr(working_a, 34) ^ rotr(working_a, 39);
+        int majority = (working_a & working_b) ^ (working_a & working_c) ^ (working_b & working_c);
+        int temp2 = big_sigma_0.wrapping_add(majority);
+        working_h = working_g;
+        working_g = working_f;
+        working_f = working_e;
+        working_e = working_d.wrapping_add(temp1);
+        working_d = working_c;
+        working_c = working_b;
+        working_b = working_a;
+        working_a = temp1.wrapping_add(temp2);
+    }
+    state[0] = state[0].wrapping_add(working_a);
+    state[1] = state[1].wrapping_add(working_b);
+    state[2] = state[2].wrapping_add(working_c);
+    state[3] = state[3].wrapping_add(working_d);
+    state[4] = state[4].wrapping_add(working_e);
+    state[5] = state[5].wrapping_add(working_f);
+    state[6] = state[6].wrapping_add(working_g);
+    state[7] = state[7].wrapping_add(working_h);
+}
+
+// Logical shift right, 1 <= distance <= 63: the arithmetic shift with the
+// copied sign bits masked off.
+int shr(int value, int distance) {
+    return (value >> distance) & ~(-1 << (64 - distance));
+}
+
+// Rotate right, 1 <= distance <= 63.
+int rotr(int value, int distance) {
+    return shr(value, distance) | (value << (64 - distance));
+}

@@ -1,0 +1,574 @@
+// The HTTP side: the accept loop, the worker pool, routing, authentication
+// and permission checks, the repository index and serving generated pages.
+//
+// URL layout:
+//
+//     /                       the repositories the requester may read
+//     /<repo>.git/...         git smart HTTP (HOARD_cgi)
+//     /<repo>/...             the repository's generated pages (HOARD_pages)
+//
+// Threads: the main thread accepts and moves each connection to a fixed pool
+// of workers over a channel; the guard thread (HOARD_auth) owns the login
+// cache and the failed-login table. A worker serves one connection to the
+// end, then takes the next, so a long clone holds one worker, not the server.
+//
+// Request bodies are streamed (`read_request_stream`), so nothing is read
+// before the request has been authorised. A response sent while a body is
+// still unread closes the connection: the next request would start inside it.
+
+import core.HOARD_addr;
+import core.HOARD_auth;
+import core.HOARD_cgi;
+import core.HOARD_html;
+import core.HOARD_store;
+import fs;
+import io;
+import net;
+import net.http;
+import os;
+
+const int MAX_REQUESTS = 100;
+const int TIMEOUT_MS = 60000;
+const int PIECE = 65536;
+const str REALM = "hoard";
+const str DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin";
+
+// --- the server --------------------------------------------------------------
+
+/// Serve on `listen` ("host:port") until the process is stopped, with
+/// `workers` worker threads.
+pub Result<void, str> serve(str config_path, str listen, int workers) {
+    match (listen.index_of(":")) {
+        case None: {
+            return Result<void, str>.Err("the listen address '" + listen + "' is not host:port");
+        }
+        case Some(_): {
+        }
+    }
+    int colon = last_colon(listen);
+    str host = listen.substr(0, colon);
+    int port = listen.substr(colon + 1, listen.size()).parse_int().or(-1);
+    if (port < 0 || port > 65535) {
+        return Result<void, str>.Err("the listen address '" + listen + "' has no valid port");
+    }
+    if (host.starts_with("[") && host.ends_with("]")) {
+        host = host.substr(1, host.size() - 1);
+    }
+    HOARD_store.load(config_path)?;
+    match (net.listen(host, port)) {
+        case Ok(net.Listener listener): {
+            Chan<HOARD_auth.Ask> asks = Chan<HOARD_auth.Ask>(256);
+            spawn guard_thread(asks);
+            Chan<net.Conn> connections = Chan<net.Conn>(64);
+            for (int index in 0 .. workers) {
+                spawn worker(connections, asks, clone(config_path));
+            }
+            io.eprint("hoard: listening on http://" + listener.local().to_str() + "/ with " + workers.to_str() + " workers\n");
+            while (true) {
+                match (listener.accept()) {
+                    case Ok(net.Conn connection): {
+                        send(connections, connection);
+                    }
+                    case Err(net.Error failure): {
+                        io.eprint("hoard: accept: " + failure.to_str() + "\n");
+                    }
+                }
+            }
+        }
+        case Err(net.Error failure): {
+            return Result<void, str>.Err("could not listen on " + listen + ": " + failure.to_str());
+        }
+    }
+}
+
+// `spawn` takes a function of this module, so the guard is started through it.
+void guard_thread(Chan<HOARD_auth.Ask> asks) {
+    HOARD_auth.guard(asks);
+}
+
+int last_colon(str text) {
+    int index = text.size() - 1;
+    while (index >= 0) {
+        if (text.byte_at(index) == ':') {
+            return index;
+        }
+        index = index - 1;
+    }
+    return -1;
+}
+
+/// A worker's view of the config: re-read on every request and re-parsed only
+/// when the bytes change.
+type View {
+    str config_path;
+    str raw = "";
+    HOARD_store.Config config = HOARD_store.default_config();
+}
+
+// The current config, or the last good one when the file is unreadable
+// mid-replace (it never is, given `save`'s rename, but a hand edit can be).
+HOARD_store.Config View.current() {
+    match (HOARD_store.read_raw(config_path)) {
+        case Some(str text): {
+            if (text != raw) {
+                match (HOARD_store.parse(text)) {
+                    case Ok(HOARD_store.Config parsed): {
+                        config = parsed;
+                        raw = text;
+                    }
+                    case Err(str problem): {
+                        io.eprint("hoard: " + config_path + ": " + problem + "; keeping the previous config\n");
+                    }
+                }
+            }
+        }
+        case None: {
+        }
+    }
+    return config;
+}
+
+void worker(Chan<net.Conn> connections, Chan<HOARD_auth.Ask> asks, str config_path) {
+    View view = View(config_path);
+    HOARD_auth.Guard guard = HOARD_auth.guard_for(asks);
+    str path_env = os.env("PATH").or(DEFAULT_PATH);
+    while (true) {
+        net.Conn connection = recv(connections);
+        serve_connection(connection, view, guard, path_env);
+    }
+}
+
+void serve_connection(net.Conn connection, View view, HOARD_auth.Guard guard, str path_env) {
+    match (connection.set_read_timeout(TIMEOUT_MS)) {
+        case Ok(_): {
+        }
+        case Err(_): {
+        }
+    }
+    match (connection.set_write_timeout(TIMEOUT_MS)) {
+        case Ok(_): {
+        }
+        case Err(_): {
+        }
+    }
+    str peer = connection.peer().ip_address().to_str();
+    for (int served in 0 .. MAX_REQUESTS) {
+        match (http.read_request_stream(connection)) {
+            case Ok(Option<http.RequestStream> maybe): {
+                match (maybe) {
+                    case Some(http.RequestStream incoming): {
+                        match (handle(connection, incoming, view, guard, peer, path_env)) {
+                            case KeepAlive: {
+                            }
+                            case Close: {
+                                return;
+                            }
+                        }
+                    }
+                    case None: {
+                        return;
+                    }
+                }
+            }
+            case Err(http.Error failure): {
+                if (failure.status() != 408) {
+                    answer_error(connection, failure);
+                }
+                return;
+            }
+        }
+    }
+}
+
+// A malformed request: answered with the module's own status and sentence,
+// then the connection closes.
+void answer_error(net.Conn connection, http.Error failure) {
+    http.Response reply = http.text_response(failure.to_str() + "\n", status: failure.status());
+    reply.set("connection", "close");
+    match (http.write_response(connection, placeholder_request(), reply, false)) {
+        case Ok: {
+        }
+        case Err(_): {
+        }
+    }
+}
+
+http.Request placeholder_request() {
+    match (http.request("GET", "http://localhost/")) {
+        case Ok(http.Request request): {
+            return request;
+        }
+        case Err(_): {
+            trap("a constant URL did not parse");
+        }
+    }
+}
+
+// --- one request -------------------------------------------------------------
+
+/// Who is asking.
+enum Who {
+    Anonymous;
+    User(str);
+    /// 401 (bad credentials) or 429 (locked out, retry after N seconds).
+    Denied(int, int);
+}
+
+HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View view, HOARD_auth.Guard guard, str peer, str path_env) {
+    http.Request request = incoming.request();
+    HOARD_store.Config config = view.current();
+    str path = request.path();
+    // `path()` is already percent-decoded, so `%2e%2e` and `%2f` arrive here
+    // as the `..` and `/` they spell, and are refused as such -- before a name
+    // is looked up, the filesystem is touched or git is run.
+    if (!path.starts_with("/") || path.contains("\\") || path.contains(str.from_chars([0]))) {
+        return plain(connection, incoming, 400, "bad path");
+    }
+    List<str> segments = path.split("/");
+    for (str segment in segments) {
+        if (segment == ".." || segment == ".") {
+            return plain(connection, incoming, 400, "bad path");
+        }
+    }
+    str address = HOARD_addr.client(peer, request.header("x-forwarded-for"), config.trusted_proxies);
+    if (path == "/") {
+        return index_page(connection, incoming, config, guard, address);
+    }
+    str first = segments[1];
+    str rest = path.substr(first.size() + 1, path.size());
+    bool is_git = first.ends_with(".git");
+    str repo = first;
+    if (is_git) {
+        repo = first.substr(0, first.size() - 4);
+    }
+    if (!HOARD_store.is_valid_repo_name(repo)) {
+        return plain(connection, incoming, 404, "not found");
+    }
+    str need = HOARD_cgi.READ;
+    if (is_git) {
+        str method = request.method();
+        if (method != "GET" && method != "HEAD" && method != "POST") {
+            return plain(connection, incoming, 405, "method not allowed");
+        }
+        need = HOARD_cgi.access_needed(rest, request.query());
+        if (need == "") {
+            return plain(connection, incoming, 404, "not found");
+        }
+    }
+    str user = "";
+    match (identify(config, request, guard, address)) {
+        case Anonymous: {
+        }
+        case User(str name): {
+            user = name;
+        }
+        case Denied(int status, int retry): {
+            return deny(connection, incoming, status, retry);
+        }
+    }
+    bool is_allowed = HOARD_store.can_read(config, repo, user);
+    if (need == HOARD_cgi.WRITE) {
+        is_allowed = HOARD_store.can_write(config, repo, user);
+    }
+    if (!is_allowed) {
+        if (user == "") {
+            return deny(connection, incoming, 401, 0);
+        }
+        // A reader who may not push learns that they may not; anyone else
+        // learns nothing about whether the repository exists.
+        if (need == HOARD_cgi.WRITE && HOARD_store.can_read(config, repo, user)) {
+            return plain(connection, incoming, 403, "forbidden");
+        }
+        return plain(connection, incoming, 404, "not found");
+    }
+    if (is_git) {
+        HOARD_cgi.Call call = HOARD_cgi.Call(repo, rest, HOARD_store.repo_root(config, view.config_path), user, address, path_env);
+        return HOARD_cgi.run(connection, incoming, call);
+    }
+    bool is_public = false;
+    match (config.repos.get(repo)) {
+        case Some(HOARD_store.Repo entry): {
+            is_public = entry.is_public;
+        }
+        case None: {
+        }
+    }
+    return page(connection, incoming, fs.join(HOARD_store.pages_root(config, view.config_path), repo), repo, rest, is_public);
+}
+
+// An anonymous identity when there is no Authorization header, a user when it
+// holds a valid login, and a denial otherwise. A wrong password is never
+// downgraded to anonymous access.
+Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard guard, str address) {
+    match (request.header("authorization")) {
+        case None: {
+            return Who.Anonymous;
+        }
+        case Some(str header): {
+            int left = guard.locked_for(address);
+            if (left > 0) {
+                return Who.Denied(429, left);
+            }
+            match (HOARD_auth.parse_basic(header)) {
+                case Some(HOARD_auth.Credentials credentials): {
+                    match (config.users.get(credentials.user)) {
+                        case Some(str hash): {
+                            if (guard.is_password_correct(credentials.user, hash, credentials.password)) {
+                                guard.succeeded(address);
+                                return Who.User(credentials.user);
+                            }
+                        }
+                        case None: {
+                            // The same work as a wrong password, so user names
+                            // cannot be found by timing.
+                            guard.is_password_correct("", HOARD_auth.DUMMY_HASH, credentials.password);
+                        }
+                    }
+                }
+                case None: {
+                }
+            }
+            guard.failed(address);
+            return Who.Denied(401, 0);
+        }
+    }
+}
+
+// --- answers -----------------------------------------------------------------
+
+// Send `reply`, buffered; the connection stays open only if the request body
+// was read to the end and neither side said close.
+HOARD_cgi.Next send_reply(net.Conn connection, http.RequestStream incoming, http.Response reply) {
+    http.Request request = incoming.request();
+    bool is_keep_alive = incoming.is_finished() && http.should_keep_alive(request, reply);
+    match (http.write_response(connection, request, reply, is_keep_alive)) {
+        case Ok: {
+            return HOARD_cgi.next_of(is_keep_alive);
+        }
+        case Err(_): {
+            return HOARD_cgi.Next.Close;
+        }
+    }
+}
+
+HOARD_cgi.Next plain(net.Conn connection, http.RequestStream incoming, int status, str message) {
+    return send_reply(connection, incoming, http.text_response(message + "\n", status: status));
+}
+
+HOARD_cgi.Next deny(net.Conn connection, http.RequestStream incoming, int status, int retry) {
+    if (status == 429) {
+        http.Response reply = http.text_response("too many failed logins; try again later\n", status: 429);
+        reply.set("retry-after", retry.to_str());
+        return send_reply(connection, incoming, reply);
+    }
+    http.Response reply = http.text_response("authentication required\n", status: 401);
+    reply.set("www-authenticate", "Basic realm=\"" + REALM + "\", charset=\"UTF-8\"");
+    return send_reply(connection, incoming, reply);
+}
+
+// Sent with every generated page. The pages are escaped as they are written;
+// this is the second line of defence: no script, frame or plugin may run.
+void page_headers(http.Response reply, bool is_public) {
+    reply.set("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'");
+    reply.set("x-content-type-options", "nosniff");
+    reply.set("referrer-policy", "same-origin");
+    if (!is_public) {
+        reply.set("cache-control", "private, no-store");
+    }
+}
+
+// --- the index ---------------------------------------------------------------
+
+HOARD_cgi.Next index_page(net.Conn connection, http.RequestStream incoming, HOARD_store.Config config, HOARD_auth.Guard guard, str address) {
+    http.Request request = incoming.request();
+    if (request.method() != "GET" && request.method() != "HEAD") {
+        return plain(connection, incoming, 405, "method not allowed");
+    }
+    str user = "";
+    match (identify(config, request, guard, address)) {
+        case Anonymous: {
+        }
+        case User(str name): {
+            user = name;
+        }
+        case Denied(int status, int retry): {
+            return deny(connection, incoming, status, retry);
+        }
+    }
+    // `/?login` asks the browser for credentials, so private repositories can
+    // be listed without a separate login page.
+    if (user == "" && request.query().split("&").contains("login")) {
+        return deny(connection, incoming, 401, 0);
+    }
+    List<str> names = [];
+    for (str name in config.repos.keys()) {
+        if (HOARD_store.can_read(config, name, user)) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    List<str> parts = [];
+    if (names.size() == 0) {
+        parts.push("<p>No repositories to show.</p>");
+    } else {
+        parts.push("<table><tr><th>Repository</th><th>Visibility</th><th>Clone path</th></tr>");
+        for (str name in names) {
+            str escaped = HOARD_html.escape(name);
+            str visibility = "private";
+            if (HOARD_store.can_read(config, name, "")) {
+                visibility = "public";
+            }
+            parts.push("<tr><td><a href=\"" + escaped + "/\">" + escaped + "</a></td><td>" + visibility + "</td><td><code>" + escaped + ".git</code></td></tr>");
+        }
+        parts.push("</table>");
+    }
+    if (user == "") {
+        parts.push("<p class=\"muted\"><a href=\"?login\">Log in</a> to see private repositories.</p>");
+    } else {
+        parts.push("<p class=\"muted\">Logged in as " + HOARD_html.escape(user) + ".</p>");
+    }
+    http.Response reply = http.response(200);
+    reply.set("content-type", "text/html; charset=utf-8");
+    reply.set_text(HOARD_html.document("Repositories", "", parts.join("\n"), ""));
+    page_headers(reply, false);
+    return send_reply(connection, incoming, reply);
+}
+
+// --- generated pages ---------------------------------------------------------
+
+HOARD_cgi.Next page(net.Conn connection, http.RequestStream incoming, str root, str repo, str rest, bool is_public) {
+    http.Request request = incoming.request();
+    if (request.method() != "GET" && request.method() != "HEAD") {
+        return plain(connection, incoming, 405, "method not allowed");
+    }
+    if (rest == "") {
+        // `/<repo>` -> `/<repo>/`, so the pages' relative links resolve.
+        http.Response reply = http.response(301);
+        reply.set("location", repo + "/");
+        return send_reply(connection, incoming, reply);
+    }
+    if (!fs.is_directory(root)) {
+        return plain(connection, incoming, 404, "no pages have been generated for this repository yet");
+    }
+    str relative = rest;
+    if (relative.ends_with("/")) {
+        relative = relative + "index.html";
+    }
+    match (resolve(root, relative)) {
+        case Some(str file): {
+            return send_file(connection, incoming, file, is_public);
+        }
+        case None: {
+            return plain(connection, incoming, 404, "not found");
+        }
+    }
+}
+
+/// The regular file `relative` names under `root`, or None. Every component is
+/// checked not to be a symbolic link, and the real path must stay inside the
+/// real root: the generator only writes regular files, and this holds even if
+/// something else has put a link in the tree.
+pub Option<str> resolve(str root, str relative) {
+    str current = root;
+    for (str segment in relative.split("/")) {
+        if (segment == "") {
+            continue;
+        }
+        if (segment == "." || segment == "..") {
+            return Option<str>.None;
+        }
+        current = fs.join(current, segment);
+        if (fs.is_link(current)) {
+            return Option<str>.None;
+        }
+    }
+    if (!fs.is_file(current)) {
+        return Option<str>.None;
+    }
+    match (fs.realpath(root)) {
+        case Ok(str real_root): {
+            match (fs.realpath(current)) {
+                case Ok(str real_file): {
+                    if (real_file.starts_with(real_root + "/")) {
+                        return Option<str>.Some(real_file);
+                    }
+                    return Option<str>.None;
+                }
+                case Err(_): {
+                    return Option<str>.None;
+                }
+            }
+        }
+        case Err(_): {
+            return Option<str>.None;
+        }
+    }
+}
+
+str content_type(str file) {
+    if (file.ends_with(".html")) {
+        return "text/html; charset=utf-8";
+    }
+    if (file.ends_with(".css")) {
+        return "text/css; charset=utf-8";
+    }
+    return "application/octet-stream";
+}
+
+HOARD_cgi.Next send_file(net.Conn connection, http.RequestStream incoming, str file, bool is_public) {
+    http.Request request = incoming.request();
+    match (io.open(file)) {
+        case Ok(io.File source): {
+            int size = 0;
+            match (fs.stat(file)) {
+                case Ok(fs.Stat info): {
+                    size = info.size;
+                }
+                case Err(_): {
+                    return plain(connection, incoming, 404, "not found");
+                }
+            }
+            http.Response reply = http.response(200);
+            reply.set("content-type", content_type(file));
+            reply.set("content-length", size.to_str());
+            page_headers(reply, is_public);
+            bool is_keep_alive = incoming.is_finished() && http.should_keep_alive(request, reply);
+            match (http.start_response(connection, request, reply, is_keep_alive)) {
+                case Ok(http.BodyWriter writer): {
+                    while (true) {
+                        match (source.read(PIECE)) {
+                            case Ok(bytes piece): {
+                                if (piece.size() == 0) {
+                                    match (writer.finish()) {
+                                        case Ok: {
+                                            return HOARD_cgi.next_of(writer.is_keep_alive());
+                                        }
+                                        case Err(_): {
+                                            return HOARD_cgi.Next.Close;
+                                        }
+                                    }
+                                }
+                                match (writer.write(piece)) {
+                                    case Ok: {
+                                    }
+                                    case Err(_): {
+                                        return HOARD_cgi.Next.Close;
+                                    }
+                                }
+                            }
+                            case Err(_): {
+                                return HOARD_cgi.Next.Close;
+                            }
+                        }
+                    }
+                }
+                case Err(_): {
+                    return HOARD_cgi.Next.Close;
+                }
+            }
+        }
+        case Err(_): {
+            return plain(connection, incoming, 404, "not found");
+        }
+    }
+}

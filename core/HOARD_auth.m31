@@ -1,0 +1,252 @@
+// HTTP Basic credentials, and the guard: the one thread that owns the login
+// cache and the failed-login table.
+//
+// Workers share nothing mutable -- refcounts are not atomic -- so the state
+// every worker must see lives in the guard thread, and a worker asks it
+// questions over a channel, passing its own reply channel. Channels are
+// shared, not moved, so this needs no lock. Every string sent is a `clone`:
+// a send moves its value, and the move is refused at run time if anything
+// else still holds a reference to it.
+//
+// Password checking runs in the worker, never in the guard, so one slow
+// verification cannot hold up anyone else's request. The guard only answers
+// cache lookups and records outcomes.
+//
+// Damping: five failures from one client address within ten minutes lock it
+// out for 60 seconds, doubling with each further failure up to 15 minutes. A
+// failed attempt is also answered a quarter of a second late, which parks
+// only that worker.
+
+import core.HOARD_crypt;
+import crypto.sha256;
+import encoding.base64;
+import timer;
+
+pub const int MAX_FAILURES = 5;
+const int FAILURE_WINDOW_NS = 600000000000;
+const int LOCKOUT_NS = 60000000000;
+const int LOCKOUT_MAX_NS = 900000000000;
+pub const int FAILURE_DELAY_MS = 250;
+const int CACHE_NS = 300000000000;
+const int MAX_TRACKED = 10000;
+/// A well-formed hash no password produces, checked against when the user
+/// does not exist, so that "no such user" costs what "wrong password" costs
+/// and user names cannot be probed by timing.
+pub const str DUMMY_HASH = "$6$hoarddummysalt$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+pub type Credentials {
+    pub str user;
+    pub str password;
+}
+
+/// The credentials in an `Authorization` header, or None when it is not a
+/// well-formed Basic credential. The caller tells "absent" from "malformed"
+/// by whether the header was there at all.
+pub Option<Credentials> parse_basic(str header) {
+    str trimmed = header.trim();
+    match (trimmed.index_of(" ")) {
+        case Some(int space): {
+            if (trimmed.substr(0, space).to_lower() != "basic") {
+                return Option<Credentials>.None;
+            }
+            str encoded = trimmed.substr(space + 1, trimmed.size()).trim();
+            match (base64.decode(encoded)) {
+                case Ok(bytes raw): {
+                    match (raw.utf8()) {
+                        case Some(str text): {
+                            match (text.index_of(":")) {
+                                case Some(int colon): {
+                                    if (colon < 1) {
+                                        return Option<Credentials>.None;
+                                    }
+                                    return Option<Credentials>.Some(Credentials(text.substr(0, colon), text.substr(colon + 1, text.size())));
+                                }
+                                case None: {
+                                    return Option<Credentials>.None;
+                                }
+                            }
+                        }
+                        case None: {
+                            return Option<Credentials>.None;
+                        }
+                    }
+                }
+                case Err(_): {
+                    return Option<Credentials>.None;
+                }
+            }
+        }
+        case None: {
+            return Option<Credentials>.None;
+        }
+    }
+}
+
+// --- the guard ---------------------------------------------------------------
+
+/// A question for the guard. Each that wants an answer carries the asking
+/// worker's reply channel.
+pub enum Ask {
+    /// Seconds left on the address's lockout, 0 when it is not locked out.
+    Locked(str, Chan<int>);
+    /// 1 when this user, stored hash and password digest verified recently,
+    /// else 0.
+    Cached(str, str, bytes, Chan<int>);
+    /// Remember a verified login: user, stored hash, password digest.
+    Remember(str, str, bytes);
+    /// A failed login from the address.
+    Failed(str);
+    /// A good login from the address: its failures are forgotten.
+    Succeeded(str);
+}
+
+type Failure {
+    int count;
+    int last_ns;
+    int until_ns = 0;
+}
+
+type Login {
+    str hash;
+    bytes digest;
+    int expires_ns;
+}
+
+/// The guard thread's body: answer `asks` for ever.
+pub void guard(Chan<Ask> asks) {
+    Map<str, Failure> failures = {};
+    Map<str, Login> logins = {};
+    while (true) {
+        int now = timer.monotonic_ns();
+        match (recv(asks)) {
+            case Locked(str address, Chan<int> reply): {
+                int left = 0;
+                match (failures.get(address)) {
+                    case Some(Failure entry): {
+                        if (entry.until_ns > now) {
+                            left = (entry.until_ns - now) / 1000000000 + 1;
+                        }
+                    }
+                    case None: {
+                    }
+                }
+                send(reply, left);
+            }
+            case Cached(str user, str hash, bytes digest, Chan<int> reply): {
+                int hit = 0;
+                match (logins.get(user)) {
+                    case Some(Login entry): {
+                        if (entry.hash == hash && now < entry.expires_ns && HOARD_crypt.is_ct_equal(entry.digest, digest)) {
+                            hit = 1;
+                        }
+                    }
+                    case None: {
+                    }
+                }
+                send(reply, hit);
+            }
+            case Remember(str user, str hash, bytes digest): {
+                if (logins.size() >= MAX_TRACKED) {
+                    logins.clear();
+                }
+                logins.set(user, Login(hash, digest, now + CACHE_NS));
+            }
+            case Failed(str address): {
+                record_failure(failures, address, now);
+            }
+            case Succeeded(str address): {
+                failures.remove(address);
+            }
+        }
+    }
+}
+
+void record_failure(Map<str, Failure> failures, str address, int now) {
+    Failure entry = Failure(0, now);
+    match (failures.get(address)) {
+        case Some(Failure seen): {
+            if (now - seen.last_ns <= FAILURE_WINDOW_NS) {
+                entry = seen;
+            }
+        }
+        case None: {
+        }
+    }
+    entry.count = entry.count + 1;
+    entry.last_ns = now;
+    if (entry.count >= MAX_FAILURES) {
+        int lockout = LOCKOUT_NS;
+        int extra = entry.count - MAX_FAILURES;
+        while (extra > 0 && lockout < LOCKOUT_MAX_NS) {
+            lockout = lockout * 2;
+            extra = extra - 1;
+        }
+        if (lockout > LOCKOUT_MAX_NS) {
+            lockout = LOCKOUT_MAX_NS;
+        }
+        entry.until_ns = now + lockout;
+    }
+    failures.set(address, entry);
+    if (failures.size() > MAX_TRACKED) {
+        prune(failures, now);
+    }
+}
+
+void prune(Map<str, Failure> failures, int now) {
+    for (str address in failures.keys()) {
+        match (failures.get(address)) {
+            case Some(Failure entry): {
+                if (now - entry.last_ns > FAILURE_WINDOW_NS && now > entry.until_ns) {
+                    failures.remove(address);
+                }
+            }
+            case None: {
+            }
+        }
+    }
+}
+
+// --- a worker's side ---------------------------------------------------------
+
+/// What a worker holds to talk to the guard: the shared question channel and
+/// its own reply channel.
+pub type Guard {
+    Chan<Ask> asks;
+    Chan<int> replies;
+}
+
+/// Seconds left on `address`'s lockout, or 0.
+pub int Guard.locked_for(str address) {
+    send(asks, Ask.Locked(clone(address), replies));
+    return recv(replies);
+}
+
+/// Whether `password` is `user`'s, whose stored hash is `hash`. A recent
+/// verified login is answered from the cache; otherwise the hash is computed
+/// here, in the worker, and a match is remembered.
+pub bool Guard.is_password_correct(str user, str hash, str password) {
+    bytes digest = sha256.sum(password.to_bytes());
+    send(asks, Ask.Cached(clone(user), clone(hash), clone(digest), replies));
+    if (recv(replies) == 1) {
+        return true;
+    }
+    if (!HOARD_crypt.is_password_correct(password, hash)) {
+        return false;
+    }
+    send(asks, Ask.Remember(clone(user), clone(hash), clone(digest)));
+    return true;
+}
+
+pub void Guard.failed(str address) {
+    send(asks, Ask.Failed(clone(address)));
+    timer.sleep_ms(FAILURE_DELAY_MS);
+}
+
+pub void Guard.succeeded(str address) {
+    send(asks, Ask.Succeeded(clone(address)));
+}
+
+/// A worker's handle on the guard, with a reply channel of its own.
+pub Guard guard_for(Chan<Ask> asks) {
+    return Guard(asks, Chan<int>(1));
+}

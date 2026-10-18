@@ -1,0 +1,71 @@
+// HTML escaping and the page layout shared by every generated page and by the
+// server's index of repositories. A port of orogit's `html.escape` and
+// `pages.document`.
+
+// The stylesheet every page carries inline: the pages are served with
+// `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`,
+// so nothing is fetched from anywhere.
+const str CSS = "body{font-family:system-ui,sans-serif;max-width:72rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fff}a{color:#0645ad;text-decoration:none}a:hover{text-decoration:underline}nav{border-bottom:1px solid #ddd;padding:.5rem 0;margin-bottom:1rem}nav a{margin-right:1rem}table{border-collapse:collapse}td,th{padding:.15rem .75rem .15rem 0;text-align:left;vertical-align:top}th{border-bottom:1px solid #ddd}pre{background:#f6f8fa;padding:.75rem;overflow-x:auto;font-size:.85rem;line-height:1.35}code,pre,.mono{font-family:ui-monospace,monospace}.muted{color:#666}.a{color:#116329}.d{color:#b31d28}.h{color:#6f42c1}.num{text-align:right}";
+
+/// `text` made safe as HTML content and inside a quoted attribute: `&`, `<`,
+/// `>`, `"` and `'` become `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#x27;`.
+/// Everything else is left as it is.
+pub str escape(str text) {
+    bytes raw = text.to_bytes();
+    bytes out = [];
+    int start = 0;
+    for (int i in 0 .. raw.size()) {
+        str entity = "";
+        int octet = raw[i];
+        if (octet == '&') {
+            entity = "&amp;";
+        } else if (octet == '<') {
+            entity = "&lt;";
+        } else if (octet == '>') {
+            entity = "&gt;";
+        } else if (octet == '"') {
+            entity = "&quot;";
+        } else if (octet == '\'') {
+            entity = "&#x27;";
+        }
+        if (entity != "") {
+            out.extend(raw.substr(start, i));
+            out.extend(entity.to_bytes());
+            start = i + 1;
+        }
+    }
+    if (start == 0) {
+        return text;
+    }
+    out.extend(raw.substr(start, raw.size()));
+    // Only ASCII bytes were replaced, so the result is as valid as `text`.
+    match (out.utf8()) {
+        case Some(str escaped): {
+            return escaped;
+        }
+        case None: {
+            trap("escape: replacing ASCII bytes broke UTF-8");
+        }
+    }
+}
+
+/// A whole HTML document. `title` is plain text and is escaped here; `body`
+/// is markup the caller has already built from escaped pieces. `prefix` is
+/// the relative path from the page to its repository's pages root (e.g.
+/// "../"). `repo` names the repository the page belongs to; "" is the
+/// server's index of repositories, whose nav says only "hoard".
+pub str document(str title, str prefix, str body, str repo) {
+    List<str> nav = [];
+    if (repo != "") {
+        str parent_link = prefix + "../";
+        nav.push("<a href=\"" + parent_link + "\">all repositories</a>");
+        nav.push("<b>" + escape(repo) + "</b>");
+        nav.push("<a href=\"" + prefix + "index.html\">summary</a>");
+        nav.push("<a href=\"" + prefix + "log.html\">log</a>");
+        nav.push("<a href=\"" + prefix + "files.html\">files</a>");
+    } else {
+        nav.push("<b>hoard</b>");
+    }
+    List<str> parts = ["<!doctype html>", "<html lang=\"en\"><head><meta charset=\"utf-8\">", "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">", "<title>" + escape(title) + "</title>", "<style>" + CSS + "</style>", "</head><body>", "<nav>" + nav.join(" ") + "</nav>", body, "</body></html>", ""];
+    return parts.join("\n");
+}
