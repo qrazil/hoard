@@ -1,0 +1,198 @@
+// Unit tests for HOARD_markdown (the README renderer) and HOARD_highlight.
+//
+// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+
+import core.HOARD_highlight;
+import core.HOARD_markdown;
+import text;
+
+type Tally {
+    int passed = 0;
+    int failed = 0;
+}
+
+void Tally.same(str name, str got, str want) {
+    if (got == want) {
+        passed = passed + 1;
+        print("ok   " + name);
+    } else {
+        failed = failed + 1;
+        print("FAIL " + name + ": got [" + got + "] want [" + want + "]");
+    }
+}
+
+void Tally.check(str name, bool is_true, str got) {
+    if (is_true) {
+        passed = passed + 1;
+        print("ok   " + name);
+    } else {
+        failed = failed + 1;
+        print("FAIL " + name + ": got [" + got + "]");
+    }
+}
+
+// The repository the links resolve against: one file and its directory.
+type Tree {
+}
+
+str Tree.href(str path) {
+    if (path == "docs/guide.md") {
+        return "file/docs.d/guide.md.html";
+    }
+    if (path == "docs" || path == "") {
+        return "files.html";
+    }
+    return "";
+}
+
+str rendered(str source) {
+    return HOARD_markdown.render(source, Tree());
+}
+
+// How many times `needle` occurs in `haystack`.
+int count_of(str haystack, str needle) {
+    return haystack.split(needle).size() - 1;
+}
+
+// Every `<` in `html` opens a tag the renderer writes itself, and every
+// href is one it may write.
+bool is_inert(str html) {
+    List<str> tags = ["p>", "/p>", "em>", "/em>", "strong>", "/strong>", "code>", "/code>", "pre>", "/pre>", "/a>", "br>", "hr>", "ul>", "/ul>", "li>", "/li>", "blockquote>", "/blockquote>", "table>", "/table>", "tr>", "/tr>", "th>", "/th>", "td>", "/td>", "span class=\"", "/span>", "h1 id=\"", "/h1>"];
+    List<str> hrefs = ["https://", "http://", "mailto:", "#", "file/", "files.html"];
+    List<str> pieces = html.split("<");
+    for (int i in 1 .. pieces.size()) {
+        str piece = pieces[i];
+        bool is_known = false;
+        for (str tag in tags) {
+            if (piece.starts_with(tag)) {
+                is_known = true;
+            }
+        }
+        if (piece.starts_with("a href=\"")) {
+            for (str href in hrefs) {
+                if (piece.substr(8, piece.size()).starts_with(href)) {
+                    is_known = true;
+                }
+            }
+        }
+        if (!is_known) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Tally tally = Tally();
+// --- blocks
+tally.same("heading with id", rendered("# Hello world"), "<h1 id=\"hello-world\">Hello world</h1>");
+tally.same("heading: closing hashes", rendered("## Two ##"), "<h2 id=\"two\">Two</h2>");
+tally.same("heading: no space is text", rendered("#tag"), "<p>#tag</p>");
+tally.same("setext heading", rendered("Title\n====="), "<h1 id=\"title\">Title</h1>");
+tally.same("paragraphs", rendered("one\ntwo\n\nthree"), "<p>one\ntwo</p>\n<p>three</p>");
+tally.same("rule", rendered("a\n\n***\n\nb"), "<p>a</p>\n<hr>\n<p>b</p>");
+tally.same("block quote", rendered("> a\n> b"), "<blockquote>\n<p>a\nb</p>\n</blockquote>");
+tally.same("nested quote", rendered("> > a"), "<blockquote>\n<blockquote>\n<p>a</p>\n</blockquote>\n</blockquote>");
+tally.same("tight list", rendered("- a\n- b"), "<ul>\n<li>a</li>\n<li>b</li>\n</ul>");
+tally.same("loose list", rendered("- a\n\n- b"), "<ul>\n<li><p>a</p></li>\n<li><p>b</p></li>\n</ul>");
+tally.same("nested list", rendered("- a\n  - b\n- c"), "<ul>\n<li>a\n<ul>\n<li>b</li>\n</ul></li>\n<li>c</li>\n</ul>");
+tally.same("ordered list with a start", rendered("3. x\n4. y"), "<ol start=\"3\">\n<li>x</li>\n<li>y</li>\n</ol>");
+tally.same("list: lazy continuation", rendered("- a\nb"), "<ul>\n<li>a\nb</li>\n</ul>");
+tally.same("fenced code, plain", rendered("```\n<b>&\n```"), "<pre><code>&lt;b&gt;&amp;\n</code></pre>");
+tally.same("fenced code, highlighted", rendered("```rust\nlet x = 1;\n```"), "<pre><code><span class=\"hk\">let</span> x = <span class=\"hn\">1</span>;\n</code></pre>");
+tally.same("fenced code: unclosed runs to the end", rendered("~~~\na\n\n# b"), "<pre><code>a\n\n# b\n</code></pre>");
+tally.same("indented code", rendered("    x < y\n\n    z"), "<pre><code>x &lt; y\n\nz\n</code></pre>");
+tally.same("table", rendered("| a | b |\n|---|:-:|\n| 1 | `2` |"), "<table>\n<tr><th>a</th><th>b</th></tr>\n<tr><td>1</td><td><code>2</code></td></tr>\n</table>");
+tally.same("table: escaped pipe and short row", rendered("a|b\n-|-\n\\|"), "<table>\n<tr><th>a</th><th>b</th></tr>\n<tr><td>|</td><td></td></tr>\n</table>");
+tally.same("tabs indent", rendered("-\tx"), "<ul>\n<li>x</li>\n</ul>");
+// --- inline
+tally.same("emphasis and strong", rendered("*a* _b_ **c** __d__"), "<p><em>a</em> <em>b</em> <strong>c</strong> <strong>d</strong></p>");
+tally.same("strong inside emphasis", rendered("***a***"), "<p><em><strong>a</strong></em></p>");
+tally.same("mixed run", rendered("***a** b*"), "<p><em><strong>a</strong> b</em></p>");
+tally.same("intraword underscore", rendered("snake_case_name"), "<p>snake_case_name</p>");
+tally.same("unmatched is literal", rendered("**a*"), "<p>*<em>a</em></p>");
+tally.same("crossed markers nest", rendered("*a _b* c_"), "<p><em>a _b</em> c_</p>");
+tally.same("code span escapes and stops emphasis", rendered("`<b>*x*</b>`"), "<p><code>&lt;b&gt;*x*&lt;/b&gt;</code></p>");
+tally.same("double backtick span", rendered("``a ` b``"), "<p><code>a ` b</code></p>");
+tally.same("backslash escape", rendered("\\*a\\* \\<b>"), "<p>*a* &lt;b&gt;</p>");
+tally.same("hard break", rendered("a  \nb"), "<p>a<br>\nb</p>");
+tally.same("autolink", rendered("<https://x.org/a?b=1&c>"), "<p><a href=\"https://x.org/a?b=1&amp;c\">https://x.org/a?b=1&amp;c</a></p>");
+tally.same("https link", rendered("[x](https://x.org \"title\")"), "<p><a href=\"https://x.org\">x</a></p>");
+tally.same("mailto link", rendered("[m](mailto:a@b.c)"), "<p><a href=\"mailto:a@b.c\">m</a></p>");
+tally.same("fragment link", rendered("[f](#usage)"), "<p><a href=\"#usage\">f</a></p>");
+tally.same("relative link to a file page", rendered("[g](docs/guide.md)"), "<p><a href=\"file/docs.d/guide.md.html\">g</a></p>");
+tally.same("relative link: ./, a fragment, percent", rendered("[g](./docs/%67uide.md#top)"), "<p><a href=\"file/docs.d/guide.md.html\">g</a></p>");
+tally.same("relative link to a directory", rendered("[d](docs/)"), "<p><a href=\"files.html\">d</a></p>");
+tally.same("relative link to a missing file is text", rendered("[n](nope.md)"), "<p>n</p>");
+tally.same("relative link above the root is text", rendered("[u](../../etc/passwd)"), "<p>u</p>");
+tally.same("link text keeps emphasis", rendered("[*a*](https://x.org)"), "<p><a href=\"https://x.org\"><em>a</em></a></p>");
+tally.same("image is a link, not an img", rendered("![logo](https://x.org/l.png)"), "<p><a href=\"https://x.org/l.png\">logo</a></p>");
+tally.same("badge: image inside a link", rendered("[![ci](https://x/b.svg)](https://x/ci)"), "<p><a href=\"https://x/ci\">ci</a></p>");
+tally.same("brackets without a destination are text", rendered("[a] [b]"), "<p>[a] [b]</p>");
+// --- safety
+List<str> hostile = ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "[x](javascript:alert(1))", "[x](JaVaScRiPt:alert(1))", "[x](java\nscript:alert(1))", "[x](&#106;avascript:alert(1))", "[x](&#x6A;avascript:alert(1))", "[x]( javascript:alert(1))", "[x](<javascript:alert(1)>)", "[x](data:text/html;base64,PHNjcmlwdD4=)", "[x](vbscript:msgbox(1))", "<javascript:alert(1)>", "![x](javascript:alert(1))", "[x](https://a\"onmouseover=\"alert(1))", "# a\"><script>alert(1)</script>", "```js\"><script>\nx\n```", "> <iframe src=x>", "| <script> |\n|---|\n| x |", "[x](\\\\evil.example/a)", "[x](//evil.example/a)", "[x](java&#x09;script:alert(1))", "[x](javascript&colon;alert(1))"];
+for (str attack in hostile) {
+    str html = rendered(attack);
+    tally.check("inert: " + text.replace(attack, "\n", "\\n"), is_inert(html) && !html.contains("evil.example/a\""), html);
+}
+tally.same("javascript: link keeps only its text", rendered("[click](javascript:alert(1))"), "<p>click</p>");
+tally.same("an attribute cannot be broken out of", rendered("[x](https://a\"b)"), "<p><a href=\"https://a&quot;b\">x</a></p>");
+tally.same("safe_href: control character", HOARD_markdown.safe_href("java\tscript:x", Tree()), "");
+tally.same("safe_href: newline", HOARD_markdown.safe_href("java\nscript:x", Tree()), "");
+tally.same("safe_href: mixed case http", HOARD_markdown.safe_href("HtTpS://x.org", Tree()), "HtTpS://x.org");
+tally.same("safe_href: network path", HOARD_markdown.safe_href("//x.org", Tree()), "");
+tally.same("safe_href: file scheme", HOARD_markdown.safe_href("file:///etc/passwd", Tree()), "");
+tally.same("raw HTML is shown", rendered("<b onclick=\"x\">hi</b>"), "<p>&lt;b onclick=&quot;x&quot;&gt;hi&lt;/b&gt;</p>");
+// --- unclosed constructs and size
+tally.same("unclosed strong", rendered("**a"), "<p>**a</p>");
+tally.same("unclosed bracket", rendered("[a(b"), "<p>[a(b</p>");
+tally.same("unclosed code span", rendered("`a"), "<p>`a</p>");
+tally.same("unclosed angle", rendered("<a"), "<p>&lt;a</p>");
+tally.same("unclosed link destination", rendered("[a](https://x"), "<p>[a](https://x</p>");
+str deep_quote = rendered(">".repeat(100000) + " x");
+tally.check("deep quotes stop at MAX_DEPTH", count_of(deep_quote, "<blockquote>") == HOARD_markdown.MAX_DEPTH, str(count_of(deep_quote, "<blockquote>")));
+str deep_list = rendered("- ".repeat(50000) + "x");
+tally.check("deep lists stop at MAX_DEPTH", count_of(deep_list, "<ul>") == HOARD_markdown.MAX_DEPTH, str(count_of(deep_list, "<ul>")));
+List<str> stairs = [];
+for (int i in 0 .. 400) {
+    stairs.push(" ".repeat(2 * i) + "- x");
+}
+str deep_indent = rendered(stairs.join("\n"));
+tally.check("deep indentation stops at MAX_DEPTH", count_of(deep_indent, "<ul>") == HOARD_markdown.MAX_DEPTH, str(count_of(deep_indent, "<ul>")));
+str brackets = rendered("[".repeat(200000) + "]".repeat(100000));
+tally.check("200k brackets", brackets.size() > 200000, "short");
+str stars = rendered("*a _b ".repeat(40000));
+tally.check("80k unmatched delimiters", stars.contains("*a _b"), "missing");
+List<str> ticks = [];
+for (int i in 1 .. 600) {
+    ticks.push("`".repeat(i));
+}
+tally.check("backtick runs of every length", rendered(ticks.join(" x ")).size() > 100000, "short");
+str long_line = rendered("a<".repeat(200000));
+tally.check("a 400 KB line is escaped", long_line.size() == 200000 * 5 + 7 && !long_line.contains("<a"), str(long_line.size()));
+// --- highlighting
+str rust = "fn main() { let s = \"a // b /* c\"; } // it's \"done\" <x>";
+tally.same("highlight: comment markers inside a string", HOARD_highlight.highlight(rust, "rust"), "<span class=\"hk\">fn</span> main() { <span class=\"hk\">let</span> s = <span class=\"hs\">&quot;a // b /* c&quot;</span>; } <span class=\"hc\">// it&#x27;s &quot;done&quot; &lt;x&gt;</span>");
+tally.same("highlight: escaped quote", HOARD_highlight.highlight("x = \"a\\\"b\" + 1", "python"), "x = <span class=\"hs\">&quot;a\\&quot;b&quot;</span> + <span class=\"hn\">1</span>");
+tally.same("highlight: unterminated string ends at its line", HOARD_highlight.highlight("'abc\nif", "lua"), "<span class=\"hs\">&#x27;abc</span>\n<span class=\"hk\">if</span>");
+tally.same("highlight: backslash at the end", HOARD_highlight.highlight("\"abc\\", "c"), "<span class=\"hs\">&quot;abc\\</span>");
+tally.same("highlight: unterminated block comment", HOARD_highlight.highlight("a /* b\nc", "go"), "a <span class=\"hc\">/* b\nc</span>");
+tally.same("highlight: python triple quotes", HOARD_highlight.highlight("'''a\n# b'''", "python"), "<span class=\"hs\">&#x27;&#x27;&#x27;a\n# b&#x27;&#x27;&#x27;</span>");
+tally.same("highlight: shell $# is not a comment", HOARD_highlight.highlight("echo $# # n", "shell"), "<span class=\"hk\">echo</span> $# <span class=\"hc\"># n</span>");
+tally.same("highlight: shell single quotes have no escapes", HOARD_highlight.highlight("'a\\' b", "shell"), "<span class=\"hs\">&#x27;a\\&#x27;</span> b");
+tally.same("highlight: digits inside a word", HOARD_highlight.highlight("x1 2", "c"), "x1 <span class=\"hn\">2</span>");
+tally.same("highlight: types", HOARD_highlight.highlight("List<str> x", "m31"), "<span class=\"ht\">List</span>&lt;<span class=\"ht\">str</span>&gt; x");
+tally.same("highlight: JSON", HOARD_highlight.highlight("{\"a\": [1.5, true, null]}", "json"), "{<span class=\"hs\">&quot;a&quot;</span>: [<span class=\"hn\">1.5</span>, <span class=\"hk\">true</span>, <span class=\"hk\">null</span>]}");
+tally.same("highlight: YAML comment needs a space", HOARD_highlight.highlight("u: http://x#y # c", "yaml"), "u: http://x#y <span class=\"hc\"># c</span>");
+tally.same("highlight: unknown language is only escaped", HOARD_highlight.highlight("<a> // 'x'", "cobol"), "&lt;a&gt; // &#x27;x&#x27;");
+tally.same("highlight: non-ASCII kept", HOARD_highlight.highlight("// é <\n\"ü\"", "javascript"), "<span class=\"hc\">// é &lt;</span>\n<span class=\"hs\">&quot;ü&quot;</span>");
+str huge = "if ".repeat(HOARD_highlight.MAX_HIGHLIGHT / 3 + 1);
+tally.check("highlight: over MAX_HIGHLIGHT is plain", !HOARD_highlight.highlight(huge, "python").contains("<span"), "spans");
+str unterminated = HOARD_highlight.highlight("`" + "<".repeat(200000), "javascript");
+tally.check("highlight: a long unterminated string", unterminated.starts_with("<span class=\"hs\">`&lt;&lt;") && unterminated.ends_with("&lt;</span>"), str(unterminated.size()));
+tally.same("language_of: extension", HOARD_highlight.language_of("src/main.RS"), "rust");
+tally.same("language_of: Dockerfile", HOARD_highlight.language_of("deploy/Dockerfile"), "dockerfile");
+tally.same("language_of: m31", HOARD_highlight.language_of("core/HOARD_pages.m31"), "m31");
+tally.same("language_of: Markdown is plain", HOARD_highlight.language_of("README.md"), "");
+tally.same("language_of: no extension", HOARD_highlight.language_of("Makefile"), "");
+tally.same("language_named: fence alias", HOARD_highlight.language_named(" TypeScript "), "javascript");
+print(str(tally.passed) + " passed, " + str(tally.failed) + " failed");

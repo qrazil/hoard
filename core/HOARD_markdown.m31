@@ -1,0 +1,1024 @@
+// A small, safe Markdown to HTML renderer for the README on a summary page.
+//
+// The subset: ATX and setext headings, paragraphs, emphasis and strong
+// emphasis, inline code, fenced code blocks (highlighted by HOARD_highlight
+// when the fence names a language) and indented ones, bullet and ordered
+// lists (nested), block quotes, horizontal rules, simple tables, links,
+// autolinks and hard line breaks. Reference-style links, footnotes and
+// everything else stay text.
+//
+// THE SAFETY RULES. Every piece of the source reaches the page through
+// `HOARD_html.escape` (or `HOARD_highlight`, which escapes the same way), so
+// raw HTML in the Markdown is shown, never interpreted; the only markup on
+// the page is the fixed tags written here. A link keeps its destination only
+// when it is http:, https:, mailto: or a #fragment, or a relative path that
+// names a file of the repository, which then points at that file's page;
+// anything else -- javascript:, data:, a scheme spelled in mixed case or
+// split by a control character, a //host -- leaves the link text as plain
+// text. An image is never inlined (the pages allow images only from their
+// own origin): it becomes a link to its source.
+//
+// Everything here is linear in the size of the source: no backtracking, no
+// search that can restart from every position, and nesting (quotes inside
+// lists inside quotes...) stops at MAX_DEPTH, past which the rest is text.
+
+import core.HOARD_highlight;
+import core.HOARD_html;
+import net.http;
+import text;
+
+/// Block quotes and lists nest at most this deep; deeper markers are text.
+pub const int MAX_DEPTH = 16;
+// An autolink `<https://...>` is at most this long.
+const int MAX_AUTOLINK = 2048;
+
+/// Where a relative link goes: the href of the page for the repository path
+/// `path` ("" is the repository's root), or "" when there is none, which
+/// leaves the link as text.
+pub interface Links {
+    str href(str path);
+}
+
+/// `source`, Markdown, as HTML.
+pub str render(str source, Links links) {
+    List<str> lines = [];
+    for (str line in text.lines(source)) {
+        lines.push(expand_tabs(line));
+    }
+    return blocks(lines, 0, false, links);
+}
+
+// --- blocks --------------------------------------------------------------------
+
+// The blocks of `lines`. `is_tight` drops the <p> around paragraphs, for the
+// items of a list with no blank line between them.
+str blocks(List<str> lines, int depth, bool is_tight, Links links) {
+    List<str> out = [];
+    if (depth >= MAX_DEPTH) {
+        // Too deep to parse further: the rest is one paragraph of text.
+        out.push("<p>" + inline(lines.join("\n").trim(), links, false) + "</p>");
+        return out.join("\n");
+    }
+    int size = lines.size();
+    int index = 0;
+    while (index < size) {
+        str line = lines[index];
+        if (is_blank(line)) {
+            index = index + 1;
+            continue;
+        }
+        str fence = fence_of(line);
+        if (fence != "") {
+            index = code_fence(lines, index, fence, out);
+            continue;
+        }
+        if (indent_of(line) >= 4) {
+            index = indented_code(lines, index, out);
+            continue;
+        }
+        int level = heading_level(line);
+        if (level > 0) {
+            out.push(heading(level, heading_text(line, level), links));
+            index = index + 1;
+            continue;
+        }
+        if (is_rule(line)) {
+            out.push("<hr>");
+            index = index + 1;
+            continue;
+        }
+        if (is_quote(line)) {
+            index = quote(lines, index, depth, links, out);
+            continue;
+        }
+        if (list_marker(line).width > 0) {
+            index = list(lines, index, depth, links, out);
+            continue;
+        }
+        if (index + 1 < size && is_table_start(line, lines[index + 1])) {
+            index = table(lines, index, links, out);
+            continue;
+        }
+        index = paragraph(lines, index, is_tight, links, out);
+    }
+    return out.join("\n");
+}
+
+// A paragraph from `lines[start]` to a blank line or the start of another
+// block; a setext underline makes it a heading. Returns the next line.
+int paragraph(List<str> lines, int start, bool is_tight, Links links, List<str> out) {
+    List<str> body = [text.trim_start(lines[start])];
+    int index = start + 1;
+    while (index < lines.size()) {
+        str line = lines[index];
+        if (is_blank(line)) {
+            break;
+        }
+        str underline = line.trim();
+        if (indent_of(line) < 4 && is_all(underline, '=')) {
+            out.push(heading(1, body.join("\n"), links));
+            return index + 1;
+        }
+        if (indent_of(line) < 4 && is_all(underline, '-')) {
+            out.push(heading(2, body.join("\n"), links));
+            return index + 1;
+        }
+        if (is_interruption(line)) {
+            break;
+        }
+        body.push(text.trim_start(line));
+        index = index + 1;
+    }
+    str content = inline(text.trim_end(body.join("\n")), links, false);
+    if (is_tight) {
+        out.push(content);
+    } else {
+        out.push("<p>" + content + "</p>");
+    }
+    return index;
+}
+
+// Does `line` start a block that ends a paragraph?
+bool is_interruption(str line) {
+    if (indent_of(line) >= 4) {
+        return false;
+    }
+    return fence_of(line) != "" || heading_level(line) > 0 || is_rule(line) || is_quote(line) || list_marker(line).width > 0;
+}
+
+int code_fence(List<str> lines, int start, str fence, List<str> out) {
+    str opener = lines[start];
+    int indent = indent_of(opener);
+    str info = opener.trim().substr(fence.size(), opener.trim().size()).trim();
+    str language = "";
+    if (info != "") {
+        language = HOARD_highlight.language_named(text.split_whitespace(info)[0]);
+    }
+    List<str> body = [];
+    int index = start + 1;
+    while (index < lines.size()) {
+        str line = lines[index];
+        str trimmed = line.trim();
+        if (indent_of(line) < 4 && trimmed.starts_with(fence) && is_all(trimmed, fence.byte_at(0))) {
+            index = index + 1;
+            break;
+        }
+        body.push(dedent(line, indent));
+        index = index + 1;
+    }
+    str code = body.join("\n");
+    if (body.size() > 0) {
+        code = code + "\n";
+    }
+    out.push("<pre><code>" + HOARD_highlight.highlight(code, language) + "</code></pre>");
+    return index;
+}
+
+int indented_code(List<str> lines, int start, List<str> out) {
+    List<str> body = [];
+    int index = start;
+    int last = start;
+    while (index < lines.size()) {
+        str line = lines[index];
+        if (is_blank(line)) {
+            body.push("");
+        } else if (indent_of(line) >= 4) {
+            body.push(dedent(line, 4));
+            last = index;
+        } else {
+            break;
+        }
+        index = index + 1;
+    }
+    // Blank lines after the last indented one belong to no block.
+    body = body.slice(0, last - start + 1);
+    out.push("<pre><code>" + HOARD_html.escape(body.join("\n") + "\n") + "</code></pre>");
+    return last + 1;
+}
+
+str heading(int level, str content, Links links) {
+    str tag = "h" + str(level);
+    return "<" + tag + " id=\"" + HOARD_html.escape(slug(content)) + "\">" + inline(content, links, false) + "</" + tag + ">";
+}
+
+// The text of an ATX heading: past its `#`s, without a closing run of `#`s.
+str heading_text(str line, int level) {
+    str trimmed = line.trim();
+    str rest = trimmed.substr(level, trimmed.size()).trim();
+    int cut = rest.size();
+    while (cut > 0 && rest.byte_at(cut - 1) == '#') {
+        cut = cut - 1;
+    }
+    if (cut == 0) {
+        return "";
+    }
+    if (cut < rest.size() && rest.byte_at(cut - 1) == ' ') {
+        return text.trim_end(rest.substr(0, cut));
+    }
+    return rest;
+}
+
+// A heading's id, as GitHub spells it, so a `#fragment` link in a README
+// reaches its heading: lower case, spaces to `-`, other punctuation dropped.
+str slug(str content) {
+    bytes out = [];
+    for (int octet in content.to_lower().to_bytes()) {
+        if ((octet >= 'a' && octet <= 'z') || (octet >= '0' && octet <= '9') || octet == '-' || octet == '_' || octet >= 0x80) {
+            out.push(octet);
+        } else if (octet == ' ') {
+            out.push('-');
+        }
+    }
+    return out.utf8().or("");
+}
+
+// A block quote: its `>` lines and the lazy lines that continue its last
+// paragraph, rendered one level deeper.
+int quote(List<str> lines, int start, int depth, Links links, List<str> out) {
+    List<str> body = [];
+    int index = start;
+    while (index < lines.size()) {
+        str line = lines[index];
+        if (is_quote(line)) {
+            str rest = text.trim_start(line).substr(1, text.trim_start(line).size());
+            if (rest.starts_with(" ")) {
+                rest = rest.substr(1, rest.size());
+            }
+            body.push(rest);
+        } else if (!is_blank(line) && body.size() > 0 && !is_blank(body[body.size() - 1]) && !is_interruption(line)) {
+            body.push(line);
+        } else {
+            break;
+        }
+        index = index + 1;
+    }
+    out.push("<blockquote>\n" + blocks(body, depth + 1, false, links) + "\n</blockquote>");
+    return index;
+}
+
+// A list item's marker: `width` is where its content starts (0: not a list
+// item), `kind` the bullet or the ordered delimiter, `number` an ordered
+// list's first number.
+type Marker {
+    int width;
+    int kind = 0;
+    int number = 1;
+}
+
+Marker list_marker(str line) {
+    int indent = indent_of(line);
+    if (indent >= 4 || indent >= line.size() || is_rule(line)) {
+        return Marker(0);
+    }
+    int size = line.size();
+    int index = indent;
+    int kind = 0;
+    int number = 1;
+    int octet = line.byte_at(index);
+    if (octet == '-' || octet == '*' || octet == '+') {
+        kind = octet;
+        index = index + 1;
+    } else {
+        int digits = 0;
+        while (index < size && digits < 9 && line.byte_at(index) >= '0' && line.byte_at(index) <= '9') {
+            index = index + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0 || index >= size || (line.byte_at(index) != '.' && line.byte_at(index) != ')')) {
+            return Marker(0);
+        }
+        number = line.substr(indent, index).parse_int().or(1);
+        kind = line.byte_at(index);
+        index = index + 1;
+    }
+    if (index == size) {
+        return Marker(index + 1, kind: kind, number: number);
+    }
+    if (line.byte_at(index) != ' ') {
+        return Marker(0);
+    }
+    int spaces = 0;
+    while (index + spaces < size && line.byte_at(index + spaces) == ' ') {
+        spaces = spaces + 1;
+    }
+    // Five spaces or more after the marker: the content is indented code,
+    // and starts one space after the marker.
+    if (spaces > 4 || index + spaces == size) {
+        spaces = 1;
+    }
+    return Marker(index + spaces, kind: kind, number: number);
+}
+
+// A list: items with the same kind of marker, each holding the lines
+// indented under it. Loose (paragraphs in <p>) when a blank line separates
+// two items or two blocks of one item.
+int list(List<str> lines, int start, int depth, Links links, List<str> out) {
+    Marker first = list_marker(lines[start]);
+    bool is_ordered = first.kind == '.' || first.kind == ')';
+    bool is_loose = false;
+    List<List<str>> items = [];
+    int size = lines.size();
+    int index = start;
+    while (index < size) {
+        Marker marker = list_marker(lines[index]);
+        if (marker.width == 0 || marker.kind != first.kind) {
+            break;
+        }
+        str opener = lines[index];
+        List<str> item = [];
+        if (marker.width < opener.size()) {
+            item.push(opener.substr(marker.width, opener.size()));
+        } else {
+            item.push("");
+        }
+        index = index + 1;
+        while (index < size) {
+            str line = lines[index];
+            if (is_blank(line)) {
+                int next = index;
+                while (next < size && is_blank(lines[next])) {
+                    next = next + 1;
+                }
+                if (next < size && indent_of(lines[next]) >= marker.width) {
+                    for (int i in index .. next) {
+                        item.push("");
+                    }
+                    is_loose = true;
+                    index = next;
+                    continue;
+                }
+                break;
+            }
+            if (indent_of(line) >= marker.width) {
+                item.push(dedent(line, marker.width));
+            } else if (!is_blank(item[item.size() - 1]) && !is_interruption(line)) {
+                item.push(line);
+            } else {
+                break;
+            }
+            index = index + 1;
+        }
+        items.push(item);
+        // A blank line, then another item of this list: the list is loose.
+        int after = index;
+        while (after < size && is_blank(lines[after])) {
+            after = after + 1;
+        }
+        if (after > index) {
+            if (after < size && list_marker(lines[after]).width > 0 && list_marker(lines[after]).kind == first.kind) {
+                is_loose = true;
+                index = after;
+            } else {
+                break;
+            }
+        }
+    }
+    str tag = "ul";
+    str open = "<ul>";
+    if (is_ordered) {
+        tag = "ol";
+        open = "<ol>";
+        if (first.number != 1) {
+            open = "<ol start=\"" + str(first.number) + "\">";
+        }
+    }
+    List<str> parts = [open];
+    for (List<str> item in items) {
+        parts.push("<li>" + blocks(item, depth + 1, !is_loose, links) + "</li>");
+    }
+    parts.push("</" + tag + ">");
+    out.push(parts.join("\n"));
+    return index;
+}
+
+bool is_table_start(str line, str next) {
+    if (!line.contains("|") || !next.contains("-")) {
+        return false;
+    }
+    List<str> cells = cells_of(next);
+    if (cells.size() == 0) {
+        return false;
+    }
+    for (str cell in cells) {
+        str inner = text.strip_suffix(text.strip_prefix(cell, ":"), ":");
+        if (inner == "" || !is_all(inner, '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int table(List<str> lines, int start, Links links, List<str> out) {
+    List<str> header = cells_of(lines[start]);
+    List<str> parts = ["<table>", row(header, header.size(), "th", links)];
+    int index = start + 2;
+    while (index < lines.size() && !is_blank(lines[index]) && lines[index].contains("|")) {
+        parts.push(row(cells_of(lines[index]), header.size(), "td", links));
+        index = index + 1;
+    }
+    parts.push("</table>");
+    out.push(parts.join("\n"));
+    return index;
+}
+
+str row(List<str> cells, int width, str tag, Links links) {
+    List<str> parts = ["<tr>"];
+    for (int i in 0 .. width) {
+        str cell = "";
+        if (i < cells.size()) {
+            cell = cells[i];
+        }
+        parts.push("<" + tag + ">" + inline(cell, links, false) + "</" + tag + ">");
+    }
+    parts.push("</tr>");
+    return parts.join("");
+}
+
+// A table row's cells: split at each `|` that is not escaped, without the
+// empty cells an outer `|` at either end makes.
+List<str> cells_of(str line) {
+    str trimmed = line.trim();
+    bytes raw = trimmed.to_bytes();
+    List<str> cells = [];
+    int start = 0;
+    int index = 0;
+    while (index < raw.size()) {
+        int octet = raw[index];
+        if (octet == '\\') {
+            index = index + 2;
+            continue;
+        }
+        if (octet == '|') {
+            cells.push(slice(raw, start, index).trim());
+            start = index + 1;
+        }
+        index = index + 1;
+    }
+    cells.push(slice(raw, start, raw.size()).trim());
+    if (trimmed.starts_with("|") && cells.size() > 0) {
+        cells.remove_at(0);
+    }
+    if (trimmed.ends_with("|") && !trimmed.ends_with("\\|") && cells.size() > 0) {
+        str dropped = cells.pop();
+    }
+    return cells;
+}
+
+// --- line tests ------------------------------------------------------------------
+
+str expand_tabs(str line) {
+    if (!line.contains("\t")) {
+        return line;
+    }
+    bytes out = [];
+    int column = 0;
+    for (int octet in line.to_bytes()) {
+        if (octet == '\t') {
+            int spaces = 4 - column % 4;
+            for (int i in 0 .. spaces) {
+                out.push(' ');
+            }
+            column = column + spaces;
+        } else {
+            out.push(octet);
+            column = column + 1;
+        }
+    }
+    return out.utf8().or(line);
+}
+
+bool is_blank(str line) {
+    return line.trim() == "";
+}
+
+int indent_of(str line) {
+    int count = 0;
+    while (count < line.size() && line.byte_at(count) == ' ') {
+        count = count + 1;
+    }
+    return count;
+}
+
+// `line` without up to `count` leading spaces.
+str dedent(str line, int count) {
+    int indent = indent_of(line);
+    if (indent > count) {
+        indent = count;
+    }
+    return line.substr(indent, line.size());
+}
+
+// Is `line` non-empty and made only of `octet`?
+bool is_all(str line, int octet) {
+    if (line == "") {
+        return false;
+    }
+    for (int found in line.to_bytes()) {
+        if (found != octet) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The run of three or more backticks or tildes that opens a code fence, or "".
+str fence_of(str line) {
+    if (indent_of(line) >= 4) {
+        return "";
+    }
+    str trimmed = text.trim_start(line);
+    if (trimmed == "") {
+        return "";
+    }
+    int marker = trimmed.byte_at(0);
+    if (marker != '`' && marker != '~') {
+        return "";
+    }
+    int count = 0;
+    while (count < trimmed.size() && trimmed.byte_at(count) == marker) {
+        count = count + 1;
+    }
+    if (count < 3) {
+        return "";
+    }
+    // A backtick fence's info string may not hold a backtick.
+    if (marker == '`' && trimmed.substr(count, trimmed.size()).contains("`")) {
+        return "";
+    }
+    return trimmed.substr(0, count);
+}
+
+int heading_level(str line) {
+    if (indent_of(line) >= 4) {
+        return 0;
+    }
+    str trimmed = text.trim_start(line);
+    int level = 0;
+    while (level < trimmed.size() && level < 7 && trimmed.byte_at(level) == '#') {
+        level = level + 1;
+    }
+    if (level == 0 || level > 6) {
+        return 0;
+    }
+    if (level < trimmed.size() && trimmed.byte_at(level) != ' ') {
+        return 0;
+    }
+    return level;
+}
+
+bool is_rule(str line) {
+    if (indent_of(line) >= 4) {
+        return false;
+    }
+    int marker = 0;
+    int count = 0;
+    for (int octet in line.to_bytes()) {
+        if (octet == ' ') {
+            continue;
+        }
+        if (octet != '-' && octet != '*' && octet != '_') {
+            return false;
+        }
+        if (marker != 0 && octet != marker) {
+            return false;
+        }
+        marker = octet;
+        count = count + 1;
+    }
+    return count >= 3;
+}
+
+bool is_quote(str line) {
+    return indent_of(line) < 4 && text.trim_start(line).starts_with(">");
+}
+
+// --- inline ----------------------------------------------------------------------
+
+// A run of inline output: text and markup ready for the page, or a run of
+// `*` or `_` (`marker`) that may open or close emphasis. `count` is how
+// many of its characters no pairing has used; `closes` and `opens` collect
+// the tags pairing gave it.
+type Piece {
+    str html;
+    int marker = 0;
+    int count = 0;
+    bool can_open = false;
+    bool can_close = false;
+    str closes = "";
+    str opens = "";
+}
+
+// Inline Markdown as HTML. Inside a link's text (`is_in_link`) there are no
+// links, so anchors never nest, and an image is its alt text.
+str inline(str source, Links links, bool is_in_link) {
+    bytes raw = source.to_bytes();
+    int size = raw.size();
+    List<int> partner = partners(raw);
+    List<Piece> pieces = [];
+    // Backtick run lengths with no closing run at or after the position kept.
+    Map<int, int> unclosed = {};
+    int plain = 0;
+    int index = 0;
+    while (index < size) {
+        int octet = raw[index];
+        if (octet == '\\' && index + 1 < size && is_punctuation(raw[index + 1])) {
+            flush(raw, plain, index, pieces);
+            pieces.push(Piece(escaped(raw, index + 1, index + 2)));
+            index = index + 2;
+            plain = index;
+        } else if (octet == '\\' && index + 1 < size && raw[index + 1] == '\n') {
+            flush(raw, plain, index, pieces);
+            pieces.push(Piece("<br>\n"));
+            index = index + 2;
+            plain = index;
+        } else if (octet == '\n' && index >= 2 && raw[index - 1] == ' ' && raw[index - 2] == ' ') {
+            int end = index;
+            while (end > plain && raw[end - 1] == ' ') {
+                end = end - 1;
+            }
+            flush(raw, plain, end, pieces);
+            pieces.push(Piece("<br>\n"));
+            index = index + 1;
+            plain = index;
+        } else if (octet == '`') {
+            int run = run_of(raw, index);
+            int closer = -1;
+            if (unclosed.get(run).or(size) > index) {
+                closer = closing_run(raw, index + run, run);
+                if (closer < 0) {
+                    unclosed.set(run, index);
+                }
+            }
+            flush(raw, plain, index, pieces);
+            if (closer < 0) {
+                pieces.push(Piece(escaped(raw, index, index + run)));
+                index = index + run;
+            } else {
+                pieces.push(Piece("<code>" + HOARD_html.escape(code_text(slice(raw, index + run, closer))) + "</code>"));
+                index = closer + run;
+            }
+            plain = index;
+        } else if ((octet == '[' || (octet == '!' && index + 1 < size && raw[index + 1] == '[')) && !is_in_link && is_link_at(raw, partner, index)) {
+            flush(raw, plain, index, pieces);
+            index = link(raw, partner, index, links, pieces);
+            plain = index;
+        } else if (octet == '!' && index + 1 < size && raw[index + 1] == '[' && is_in_link && is_link_at(raw, partner, index)) {
+            // An image inside a link's text: its alt text.
+            flush(raw, plain, index, pieces);
+            int label_end = partner[index + 1];
+            pieces.push(Piece(escaped(raw, index + 2, label_end)));
+            index = partner[label_end + 1] + 1;
+            plain = index;
+        } else if (octet == '<' && !is_in_link && autolink_end(raw, index) > 0) {
+            int end = autolink_end(raw, index);
+            str target = slice(raw, index + 1, end);
+            flush(raw, plain, index, pieces);
+            pieces.push(Piece("<a href=\"" + HOARD_html.escape(target) + "\">" + HOARD_html.escape(target) + "</a>"));
+            index = end + 1;
+            plain = index;
+        } else if (octet == '*' || octet == '_') {
+            flush(raw, plain, index, pieces);
+            int run = run_of(raw, index);
+            pieces.push(delimiter(raw, index, run));
+            index = index + run;
+            plain = index;
+        } else {
+            index = index + 1;
+        }
+    }
+    flush(raw, plain, size, pieces);
+    pair_emphasis(pieces);
+    List<str> out = [];
+    for (Piece piece in pieces) {
+        if (piece.marker == 0) {
+            out.push(piece.html);
+        } else {
+            out.push(piece.closes);
+            out.push(str.from_chars([piece.marker]).repeat(piece.count));
+            out.push(piece.opens);
+        }
+    }
+    return out.join("");
+}
+
+// For each `[` and `(` the index of the `]` or `)` that closes it, else -1.
+// One pass with a stack each, so finding a link's end never rescans.
+List<int> partners(bytes raw) {
+    int size = raw.size();
+    List<int> partner = [-1; size];
+    List<int> brackets = [];
+    List<int> parens = [];
+    int index = 0;
+    while (index < size) {
+        int octet = raw[index];
+        if (octet == '\\') {
+            index = index + 2;
+            continue;
+        }
+        if (octet == '[') {
+            brackets.push(index);
+        } else if (octet == ']' && brackets.size() > 0) {
+            partner[brackets.pop()] = index;
+        } else if (octet == '(') {
+            parens.push(index);
+        } else if (octet == ')' && parens.size() > 0) {
+            partner[parens.pop()] = index;
+        }
+        index = index + 1;
+    }
+    return partner;
+}
+
+// Is there a link (or, at `!`, an image) `[text](destination)` at `index`?
+bool is_link_at(bytes raw, List<int> partner, int index) {
+    int open = index;
+    if (raw[index] == '!') {
+        open = index + 1;
+    }
+    int closer = partner[open];
+    return closer > 0 && closer + 1 < raw.size() && raw[closer + 1] == '(' && partner[closer + 1] > 0;
+}
+
+// The link or image at `index`, onto `pieces`; returns where its `)` ends.
+int link(bytes raw, List<int> partner, int index, Links links, List<Piece> pieces) {
+    bool is_image = raw[index] == '!';
+    int open = index;
+    if (is_image) {
+        open = index + 1;
+    }
+    int closer = partner[open];
+    int end = partner[closer + 1];
+    str label = slice(raw, open + 1, closer);
+    str href = safe_href(destination(slice(raw, closer + 2, end)), links);
+    str content = "";
+    if (is_image) {
+        content = HOARD_html.escape(label);
+        if (label.trim() == "") {
+            content = "image";
+        }
+    } else {
+        content = inline(label, links, true);
+    }
+    if (href == "") {
+        pieces.push(Piece(content));
+    } else {
+        pieces.push(Piece("<a href=\"" + HOARD_html.escape(href) + "\">" + content + "</a>"));
+    }
+    return end + 1;
+}
+
+// A link's destination from what its parentheses hold: `<...>` or up to the
+// first space (a title after it is dropped).
+str destination(str inside) {
+    str trimmed = inside.trim();
+    if (trimmed.starts_with("<")) {
+        match (trimmed.index_of(">")) {
+            case Some(int found): {
+                return trimmed.substr(1, found);
+            }
+            case None: {
+                return "";
+            }
+        }
+    }
+    List<str> words = text.split_whitespace(trimmed);
+    if (words.size() == 0) {
+        return "";
+    }
+    return words[0];
+}
+
+/// The href a link to `target` may have, or "" when it may not have one: an
+/// http:, https: or mailto: URL as it is, a #fragment as it is, and a
+/// relative path to the page `links` gives for it. Everything else -- any
+/// other scheme in any spelling, a control character or space anywhere, a
+/// network-path `//host` -- is refused.
+pub str safe_href(str target, Links links) {
+    if (target == "") {
+        return "";
+    }
+    for (int octet in target.to_bytes()) {
+        if (octet <= ' ' || octet == 0x7f) {
+            return "";
+        }
+    }
+    if (target.starts_with("#")) {
+        return target;
+    }
+    bytes raw = target.to_bytes();
+    for (int i in 0 .. raw.size()) {
+        int octet = raw[i];
+        if (octet == ':') {
+            str scheme = slice(raw, 0, i).to_lower();
+            if (scheme == "http" || scheme == "https" || scheme == "mailto") {
+                return target;
+            }
+            return "";
+        }
+        if (octet == '/' || octet == '?' || octet == '#' || octet == '\\') {
+            break;
+        }
+    }
+    if (target.starts_with("//") || target.starts_with("\\") || target.starts_with("/\\")) {
+        return "";
+    }
+    // A path in the repository: without its query and fragment, decoded,
+    // and with `.` and `..` resolved; climbing above the root is refused.
+    str path = target;
+    List<str> cuts = ["#", "?"];
+    for (str cut in cuts) {
+        match (path.index_of(cut)) {
+            case Some(int found): {
+                path = path.substr(0, found);
+            }
+            case None: {
+            }
+        }
+    }
+    match (http.unquote(path)) {
+        case Ok(str decoded): {
+            path = decoded;
+        }
+        case Err(_): {
+            return "";
+        }
+    }
+    List<str> segments = [];
+    for (str segment in path.split("/")) {
+        if (segment == "" || segment == ".") {
+            continue;
+        }
+        if (segment == "..") {
+            if (segments.size() == 0) {
+                return "";
+            }
+            str gone = segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+    return links.href(segments.join("/"));
+}
+
+// Where an autolink `<scheme:...>` at `index` ends (its `>`), or -1.
+int autolink_end(bytes raw, int index) {
+    int limit = index + MAX_AUTOLINK;
+    if (limit > raw.size()) {
+        limit = raw.size();
+    }
+    for (int i in index + 1 .. limit) {
+        int octet = raw[i];
+        if (octet == '>') {
+            str target = slice(raw, index + 1, i);
+            str lower = target.to_lower();
+            if ((lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")) && safe_href(target, NoLinks()) == target) {
+                return i;
+            }
+            return -1;
+        }
+        if (octet <= ' ' || octet == '<' || octet == 0x7f) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+// The Links of nothing, for checks that never reach a relative path.
+type NoLinks {
+}
+
+str NoLinks.href(str path) {
+    return "";
+}
+
+// A run of `*` or `_`, and whether it can open or close emphasis
+// (CommonMark's flanking rules; `_` never opens or closes inside a word).
+Piece delimiter(bytes raw, int index, int run) {
+    int marker = raw[index];
+    int before = ' ';
+    if (index > 0) {
+        before = raw[index - 1];
+    }
+    int after = ' ';
+    if (index + run < raw.size()) {
+        after = raw[index + run];
+    }
+    bool is_left = !is_space(after) && (!is_punctuation(after) || is_space(before) || is_punctuation(before));
+    bool is_right = !is_space(before) && (!is_punctuation(before) || is_space(after) || is_punctuation(after));
+    bool can_open = is_left;
+    bool can_close = is_right;
+    if (marker == '_') {
+        can_open = is_left && (!is_right || is_punctuation(before));
+        can_close = is_right && (!is_left || is_punctuation(after));
+    }
+    return Piece("", marker: marker, count: run, can_open: can_open, can_close: can_close);
+}
+
+// Pair emphasis openers with closers, innermost first, with one stack per
+// marker. A pair throws away every opener between its ends, on both stacks,
+// so the tags always nest; each piece is pushed and popped at most once.
+void pair_emphasis(List<Piece> pieces) {
+    List<int> stars = [];
+    List<int> underscores = [];
+    for (int i in 0 .. pieces.size()) {
+        Piece piece = pieces[i];
+        if (piece.marker == 0) {
+            continue;
+        }
+        List<int> same = stars;
+        List<int> other = underscores;
+        if (piece.marker == '_') {
+            same = underscores;
+            other = stars;
+        }
+        if (piece.can_close) {
+            while (piece.count > 0 && same.size() > 0) {
+                int opener_at = same[same.size() - 1];
+                Piece opener = pieces[opener_at];
+                while (other.size() > 0 && other[other.size() - 1] > opener_at) {
+                    int dropped = other.pop();
+                }
+                int used = 1;
+                str tag = "em";
+                if (opener.count >= 2 && piece.count >= 2) {
+                    used = 2;
+                    tag = "strong";
+                }
+                opener.opens = "<" + tag + ">" + opener.opens;
+                piece.closes = piece.closes + "</" + tag + ">";
+                opener.count = opener.count - used;
+                piece.count = piece.count - used;
+                if (opener.count == 0) {
+                    int done = same.pop();
+                }
+            }
+        }
+        if (piece.count > 0 && piece.can_open) {
+            same.push(i);
+        }
+    }
+}
+
+void flush(bytes raw, int from, int until, List<Piece> pieces) {
+    if (until > from) {
+        pieces.push(Piece(escaped(raw, from, until)));
+    }
+}
+
+str escaped(bytes raw, int from, int until) {
+    bytes out = [];
+    HOARD_highlight.put(out, raw, from, until);
+    return out.utf8().or("");
+}
+
+// `raw[from .. until]` as text; the cuts are at ASCII bytes, so whole characters.
+str slice(bytes raw, int from, int until) {
+    return raw.substr(from, until).utf8().or("");
+}
+
+int run_of(bytes raw, int index) {
+    int octet = raw[index];
+    int end = index;
+    while (end < raw.size() && raw[end] == octet) {
+        end = end + 1;
+    }
+    return end - index;
+}
+
+// The start of the first run of exactly `run` backticks at or after `from`,
+// or -1.
+int closing_run(bytes raw, int from, int run) {
+    int index = from;
+    while (index < raw.size()) {
+        if (raw[index] == '`') {
+            int found = run_of(raw, index);
+            if (found == run) {
+                return index;
+            }
+            index = index + found;
+        } else {
+            index = index + 1;
+        }
+    }
+    return -1;
+}
+
+// A code span's text: line breaks become spaces, and one space is stripped
+// from each end when both ends have one.
+str code_text(str inside) {
+    str flat = text.replace(inside, "\n", " ");
+    if (flat.size() >= 2 && flat.starts_with(" ") && flat.ends_with(" ") && flat.trim() != "") {
+        return flat.substr(1, flat.size() - 1);
+    }
+    return flat;
+}
+
+bool is_space(int octet) {
+    return octet == ' ' || octet == '\t' || octet == '\n' || octet == '\r';
+}
+
+// ASCII punctuation: what a backslash escapes, and what the flanking rules
+// call punctuation.
+bool is_punctuation(int octet) {
+    return (octet >= '!' && octet <= '/') || (octet >= ':' && octet <= '@') || (octet >= '[' && octet <= '`') || (octet >= '{' && octet <= '~');
+}

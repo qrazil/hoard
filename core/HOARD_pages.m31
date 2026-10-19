@@ -3,10 +3,12 @@
 // For one repository it writes, under its pages directory:
 //
 //     index.html                 summary: clone path, branches, tags, recent
-//                                commits, and the README as escaped text
+//                                commits, and the README (Markdown rendered
+//                                by HOARD_markdown, other text escaped)
 //     log.html                   the latest LOG_LIMIT commits
 //     files.html                 every file of the default branch
-//     file/<dir>.d/<name>.html   one page per file
+//     file/<dir>.d/<name>.html   one page per file, highlighted by
+//                                HOARD_highlight when its language is known
 //     commit/<sha>.html          one page per commit, with its diff
 //
 // Everything comes from asking git -- `for-each-ref`, `log`, `ls-tree`,
@@ -26,7 +28,9 @@
 // commit force-pushed away -- are removed, and so are the directories they
 // leave empty.
 
+import core.HOARD_highlight;
 import core.HOARD_html;
+import core.HOARD_markdown;
 import date;
 import fs;
 import io;
@@ -52,6 +56,9 @@ const str TEMP_SUFFIX = ".tmp";
 const int TEMP_MAX_AGE_NS = 600 * 1000 * 1000 * 1000;
 const str LOG_FORMAT = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b";
 const List<str> REF_PREFIXES = ["refs/heads/", "refs/tags/"];
+// The README the summary shows: the first of these names, in any case, at
+// the top of the tree. The first two are Markdown.
+const List<str> README_NAMES = ["readme.md", "readme.markdown", "readme", "readme.txt", "readme.rst"];
 
 // --- talking to git ----------------------------------------------------------
 
@@ -666,7 +673,7 @@ str file_body(Entry entry, Option<bytes> blob) {
     if (is_binary(data)) {
         return head + info + "<p>Binary file, " + str(entry.size) + " bytes.</p>";
     }
-    return head + info + "<pre>" + esc(lossy(data)) + "</pre>";
+    return head + info + "<pre>" + HOARD_highlight.highlight(lossy(data), HOARD_highlight.language_of(entry.path)) + "</pre>";
 }
 
 Result<str, str> commit_page(Git git, str repo, Commit commit) {
@@ -769,29 +776,59 @@ str summary_page(Git git, str repo, str base_url, str branch, List<Commit> commi
         recent = commits.slice(0, RECENT);
     }
     parts.push(commit_rows(recent, ""));
-    for (Entry entry in entries) {
-        if (entry.kind != "blob" || entry.path.contains("/")) {
-            continue;
-        }
-        str stem = text.strip_suffix(text.strip_suffix(text.strip_suffix(entry.path.to_lower(), ".md"), ".txt"), ".rst");
-        if (stem != "readme") {
-            continue;
-        }
-        if (entry.size <= MAX_BLOB) {
+    parts.push(readme(entries, contents));
+    return HOARD_html.document(repo, "", parts.join("\n"), repo);
+}
+
+// The README section of the summary, or "" when the tree has no README that
+// can be shown (none, binary, or over MAX_BLOB).
+str readme(List<Entry> entries, Map<str, bytes> contents) {
+    for (str wanted in README_NAMES) {
+        for (Entry entry in entries) {
+            if (entry.kind != "blob" || entry.mode == "120000" || entry.path.to_lower() != wanted) {
+                continue;
+            }
             match (contents.get(entry.sha)) {
                 case Some(bytes data): {
-                    if (!is_binary(data)) {
-                        parts.push("<h3>" + esc(entry.path) + "</h3>");
-                        parts.push("<pre>" + esc(lossy(data)) + "</pre>");
+                    if (entry.size > MAX_BLOB || is_binary(data)) {
+                        return "";
                     }
+                    str heading = "<h3>" + esc(entry.path) + "</h3>";
+                    if (wanted.ends_with(".md") || wanted.ends_with(".markdown")) {
+                        return heading + "\n<div class=\"readme\">\n" + HOARD_markdown.render(lossy(data), FileLinks(link_targets(entries))) + "\n</div>";
+                    }
+                    return heading + "\n<pre>" + esc(lossy(data)) + "</pre>";
                 }
                 case None: {
+                    return "";
                 }
             }
         }
-        break;
     }
-    return HOARD_html.document(repo, "", parts.join("\n"), repo);
+    return "";
+}
+
+// Where a relative link in the README goes: a file to its page, a directory
+// (or the root) to the list of files. Links to anything else stay text.
+type FileLinks {
+    Map<str, str> targets;
+}
+
+str FileLinks.href(str path) {
+    return targets.get(path).or("");
+}
+
+Map<str, str> link_targets(List<Entry> entries) {
+    Map<str, str> targets = {"": "files.html"};
+    for (Entry entry in entries) {
+        if (entry.page != "") {
+            targets.set(entry.path, entry.page);
+        }
+        for (int i in 1 .. entry.segments.size()) {
+            targets.set(entry.segments.slice(0, i).join("/"), "files.html");
+        }
+    }
+    return targets;
 }
 
 // --- writing files -----------------------------------------------------------

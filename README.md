@@ -11,6 +11,10 @@ file and URL layout.
 /<repo>/...           the repository's generated pages
 ```
 
+The pages are static HTML with no JavaScript: a summary with the README
+(Markdown rendered as a safe subset), the log, the file list, a
+syntax-highlighted page per file and a page per commit.
+
 ## Install
 
 ```
@@ -72,17 +76,19 @@ end-to-end suite (`tests/e2e.sh`, a real git client against the built server).
 ## Layout
 
 ```
-hoard.m31              the command line
-core/HOARD_store.m31   config, permissions, atomic save, admin lock
-core/HOARD_addr.m31    client address through trusted proxies
-core/HOARD_crypt.m31   SHA-512-crypt
-core/HOARD_auth.m31    Basic credentials; the guard thread (cache, damping)
-core/HOARD_server.m31  accept loop, workers, routing, index, page serving
-core/HOARD_cgi.m31     git http-backend, streamed
-core/HOARD_pages.m31   the page generator
-core/HOARD_html.m31    escaping and page layout
-tests/                 test.sh runs everything
-docs/design.md         how it works and why
+hoard.m31                the command line
+core/HOARD_store.m31     config, permissions, atomic save, admin lock
+core/HOARD_addr.m31      client address through trusted proxies
+core/HOARD_crypt.m31     SHA-512-crypt
+core/HOARD_auth.m31      Basic credentials; the guard thread (cache, damping)
+core/HOARD_server.m31    accept loop, workers, routing, index, page serving
+core/HOARD_cgi.m31       git http-backend, streamed
+core/HOARD_pages.m31     the page generator
+core/HOARD_markdown.m31  the README's Markdown (a safe subset) to HTML
+core/HOARD_highlight.m31 syntax highlighting for file pages and code blocks
+core/HOARD_html.m31      escaping and page layout
+tests/                   test.sh runs everything
+docs/design.md           how it works and why
 ```
 
 ## Release

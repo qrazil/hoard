@@ -660,6 +660,55 @@ LINKS=$(find "$SRV/pages" -type l)
 [ -z "$LINKS" ]
 check "the generated tree contains no symlinks" $? "$LINKS"
 
+section "8a. the README is rendered, code is highlighted"
+cat >"$W/README.md" <<'MDEOF'
+# Hoard *test*
+
+See [the guide](docs/guide.txt), [home](https://example.org/) and [gone](missing.md).
+
+```rust
+fn main() { let s = "// not a comment"; }
+```
+
+- one
+- two
+MDEOF
+printf 'fn main() {\n    // say hi\n    println!("<hi>");\n}\n' >"$W/src.rs"
+git -C "$W" add README.md src.rs >/dev/null 2>&1
+git -C "$W" commit -q -m "a Markdown README and some Rust"
+g -C "$W" push "$(aurl "$ALICE" /pub.git)" main
+check "push of the Markdown README" $? "$(glast)"
+get /pub/
+[ "$ST" = 200 ] && body_has '<div class="readme">' && body_has '<h1 id="hoard-test">Hoard <em>test</em></h1>' && body_has '<li>one</li>'
+check "the summary renders README.md as HTML" $? "status $ST"
+body_has '<a href="file/docs.d/guide.txt.html">the guide</a>' && body_has '<a href="https://example.org/">home</a>' && ! body_has 'href="missing.md' && body_has 'gone'
+check "README links: a file to its page, https as is, a missing file as text" $?
+body_has '<span class="hk">fn</span>' && body_has '<span class="hs">&quot;// not a comment&quot;</span>'
+check "a README code fence is highlighted" $?
+get /pub/file/src.rs.html
+[ "$ST" = 200 ] && body_has '<span class="hc">// say hi</span>' && body_has '<span class="hs">&quot;&lt;hi&gt;&quot;</span>'
+check "a Rust file page carries highlight classes, still escaped" $? "status $ST"
+cat >"$W/README.md" <<'MDEOF'
+<script>alert(1)</script> <img src=x onerror=alert(1)>
+
+[a](javascript:alert(1)) [b](JaVaScRiPt:alert(1)) [c](&#106;avascript:alert(1)) [d](data:text/html,x)
+![e](javascript:alert(1)) <javascript:alert(1)> [f](https://x.org/"onmouseover="alert(1))
+
+```"><script>alert(2)</script>
+<script>alert(3)</script>
+MDEOF
+git -C "$W" add README.md >/dev/null 2>&1
+git -C "$W" commit -q -m "a hostile README"
+g -C "$W" push "$(aurl "$ALICE" /pub.git)" main
+check "push of the hostile README" $? "$(glast)"
+get /pub/
+[ "$ST" = 200 ] && ! body_has '<script>' && ! body_has '<img' && body_has '&lt;img src=x onerror=alert(1)&gt;'
+check "raw HTML in a README is shown, not run" $? "status $ST"
+! grep -qi 'href="[^"]*\(javascript\|data:\|&#106;\)' "$T/r.b" && body_has 'href="https://x.org/&quot;onmouseover=&quot;alert(1)"'
+check "README links with a bad scheme are text; quotes stay escaped" $? "$(grep -o 'href="[^"]*"' "$T/r.b" | head -5)"
+body_has '&lt;script&gt;alert(3)&lt;/script&gt;'
+check "an unclosed code fence still escapes its content" $?
+
 ELAPSED=$((SECONDS - SECONDS_AT_START))
 [ "$ELAPSED" -lt 20 ]
 check "sections 1-4, 7 and 8 finished without a stalled request (< 20 s)" $? "$ELAPSED s"

@@ -1,0 +1,340 @@
+// Syntax highlighting for file pages and README code blocks: a small
+// lexer-style tokenizer with one table per language, nothing more.
+//
+// It knows comments, strings, numbers, keywords and (for a few languages)
+// type names, and wraps each in a span whose class the stylesheet colours:
+// `hc` comment, `hs` string, `hn` number, `hk` keyword, `ht` type. It does
+// not parse: a construct it does not know is plain text, and plain text is
+// always a correct answer.
+//
+// Every byte of the source is HTML-escaped on its way out, inside a token or
+// not. The tokenizer makes one pass over the source and never backs up, so
+// it is linear in the size of the file whatever the file holds: an
+// unterminated string ends at its line (or at the end of the file, for the
+// kinds that may span lines), and an unterminated comment at the end of the
+// file.
+
+/// Files bigger than this are shown without highlighting: the spans would
+/// make the page several times the size of the file.
+pub const int MAX_HIGHLIGHT = 256 * 1024;
+const int KEYWORD = 1;
+const int TYPE = 2;
+// Language names as written after a code fence, and file extensions, to the
+// language they mean.
+const Map<str, str> ALIASES = {"m31": "m31", "rust": "rust", "rs": "rust", "lua": "lua", "sh": "shell", "bash": "shell", "zsh": "shell", "shell": "shell", "console": "shell", "python": "python", "py": "python", "javascript": "javascript", "js": "javascript", "mjs": "javascript", "cjs": "javascript", "jsx": "javascript", "typescript": "javascript", "ts": "javascript", "tsx": "javascript", "c": "c", "h": "c", "cpp": "c", "c++": "c", "cc": "c", "cxx": "c", "hpp": "c", "hh": "c", "go": "go", "golang": "go", "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml", "dockerfile": "dockerfile", "docker": "dockerfile", "containerfile": "dockerfile"};
+const Map<str, int> M31_WORDS = {"break": 1, "case": 1, "const": 1, "continue": 1, "else": 1, "enum": 1, "false": 1, "for": 1, "if": 1, "import": 1, "in": 1, "interface": 1, "match": 1, "pub": 1, "return": 1, "spawn": 1, "true": 1, "type": 1, "while": 1, "distinct": 1, "this": 1, "int": 2, "float": 2, "bool": 2, "str": 2, "bytes": 2, "void": 2};
+const Map<str, int> RUST_WORDS = {"as": 1, "async": 1, "await": 1, "break": 1, "const": 1, "continue": 1, "crate": 1, "dyn": 1, "else": 1, "enum": 1, "extern": 1, "false": 1, "fn": 1, "for": 1, "if": 1, "impl": 1, "in": 1, "let": 1, "loop": 1, "match": 1, "mod": 1, "move": 1, "mut": 1, "pub": 1, "ref": 1, "return": 1, "self": 1, "static": 1, "struct": 1, "super": 1, "trait": 1, "true": 1, "type": 1, "unsafe": 1, "use": 1, "where": 1, "while": 1, "i8": 2, "i16": 2, "i32": 2, "i64": 2, "i128": 2, "isize": 2, "u8": 2, "u16": 2, "u32": 2, "u64": 2, "u128": 2, "usize": 2, "f32": 2, "f64": 2, "bool": 2, "char": 2, "str": 2};
+const Map<str, int> LUA_WORDS = {"and": 1, "break": 1, "do": 1, "else": 1, "elseif": 1, "end": 1, "false": 1, "for": 1, "function": 1, "goto": 1, "if": 1, "in": 1, "local": 1, "nil": 1, "not": 1, "or": 1, "repeat": 1, "return": 1, "then": 1, "true": 1, "until": 1, "while": 1};
+const Map<str, int> SHELL_WORDS = {"case": 1, "do": 1, "done": 1, "elif": 1, "else": 1, "esac": 1, "fi": 1, "for": 1, "function": 1, "if": 1, "in": 1, "then": 1, "until": 1, "while": 1, "local": 1, "export": 1, "readonly": 1, "return": 1, "exit": 1, "set": 1, "unset": 1, "shift": 1, "trap": 1, "echo": 1, "printf": 1, "cd": 1, "exec": 1, "eval": 1, "source": 1};
+const Map<str, int> PYTHON_WORDS = {"False": 1, "None": 1, "True": 1, "and": 1, "as": 1, "assert": 1, "async": 1, "await": 1, "break": 1, "class": 1, "continue": 1, "def": 1, "del": 1, "elif": 1, "else": 1, "except": 1, "finally": 1, "for": 1, "from": 1, "global": 1, "if": 1, "import": 1, "in": 1, "is": 1, "lambda": 1, "nonlocal": 1, "not": 1, "or": 1, "pass": 1, "raise": 1, "return": 1, "try": 1, "while": 1, "with": 1, "yield": 1, "self": 1, "int": 2, "float": 2, "str": 2, "bytes": 2, "bool": 2, "list": 2, "dict": 2, "set": 2, "tuple": 2};
+const Map<str, int> JAVASCRIPT_WORDS = {"async": 1, "await": 1, "break": 1, "case": 1, "catch": 1, "class": 1, "const": 1, "continue": 1, "debugger": 1, "default": 1, "delete": 1, "do": 1, "else": 1, "export": 1, "extends": 1, "false": 1, "finally": 1, "for": 1, "from": 1, "function": 1, "if": 1, "import": 1, "in": 1, "instanceof": 1, "interface": 1, "let": 1, "new": 1, "null": 1, "of": 1, "return": 1, "static": 1, "super": 1, "switch": 1, "this": 1, "throw": 1, "true": 1, "try": 1, "type": 1, "typeof": 1, "undefined": 1, "var": 1, "void": 1, "while": 1, "yield": 1, "enum": 1, "implements": 1, "private": 1, "public": 1, "readonly": 1, "string": 2, "number": 2, "boolean": 2, "any": 2, "unknown": 2, "never": 2, "object": 2};
+const Map<str, int> C_WORDS = {"auto": 1, "break": 1, "case": 1, "class": 1, "const": 1, "continue": 1, "default": 1, "delete": 1, "do": 1, "else": 1, "enum": 1, "extern": 1, "false": 1, "for": 1, "goto": 1, "if": 1, "inline": 1, "namespace": 1, "new": 1, "nullptr": 1, "private": 1, "protected": 1, "public": 1, "return": 1, "sizeof": 1, "static": 1, "struct": 1, "switch": 1, "template": 1, "this": 1, "true": 1, "typedef": 1, "typename": 1, "union": 1, "using": 1, "virtual": 1, "volatile": 1, "while": 1, "include": 1, "define": 1, "ifdef": 1, "ifndef": 1, "endif": 1, "pragma": 1, "NULL": 1, "void": 2, "char": 2, "short": 2, "int": 2, "long": 2, "float": 2, "double": 2, "signed": 2, "unsigned": 2, "bool": 2, "size_t": 2, "int8_t": 2, "int16_t": 2, "int32_t": 2, "int64_t": 2, "uint8_t": 2, "uint16_t": 2, "uint32_t": 2, "uint64_t": 2};
+const Map<str, int> GO_WORDS = {"break": 1, "case": 1, "chan": 1, "const": 1, "continue": 1, "default": 1, "defer": 1, "else": 1, "fallthrough": 1, "false": 1, "for": 1, "func": 1, "go": 1, "goto": 1, "if": 1, "import": 1, "interface": 1, "iota": 1, "map": 1, "nil": 1, "package": 1, "range": 1, "return": 1, "select": 1, "struct": 1, "switch": 1, "true": 1, "type": 1, "var": 1, "bool": 2, "byte": 2, "error": 2, "float32": 2, "float64": 2, "int": 2, "int8": 2, "int16": 2, "int32": 2, "int64": 2, "rune": 2, "string": 2, "uint": 2, "uint8": 2, "uint16": 2, "uint32": 2, "uint64": 2, "uintptr": 2, "any": 2};
+const Map<str, int> DATA_WORDS = {"true": 1, "false": 1, "null": 1, "yes": 1, "no": 1, "on": 1, "off": 1};
+const Map<str, int> DOCKERFILE_WORDS = {"FROM": 1, "RUN": 1, "CMD": 1, "LABEL": 1, "EXPOSE": 1, "ENV": 1, "ADD": 1, "COPY": 1, "ENTRYPOINT": 1, "VOLUME": 1, "USER": 1, "WORKDIR": 1, "ARG": 1, "ONBUILD": 1, "STOPSIGNAL": 1, "HEALTHCHECK": 1, "SHELL": 1, "AS": 1};
+
+// One language's lexical rules.
+type Syntax {
+    Map<str, int> words;
+    // Line comment markers, longest first where one starts another.
+    List<str> line_comments = [];
+    // A block comment's delimiters; "" for none. Not nested.
+    str block_open = "";
+    str block_close = "";
+    // A line comment starts only at the start of a line or after a space
+    // (shell's `$#`, YAML's `http://x#y`).
+    bool is_comment_after_space = false;
+    // Quote bytes of strings with backslash escapes that end at their line.
+    str quotes = "";
+    // ...that may run over several lines.
+    str long_quotes = "";
+    // ...without escapes, that may run over several lines.
+    str raw_quotes = "";
+    // Python's `"""` and `'''`.
+    bool is_triple_quoted = false;
+    // An identifier that starts with a capital letter is a type.
+    bool is_capital_type = false;
+}
+
+/// The language a fence's info string or a file extension names, or "" when
+/// there is none this module knows.
+pub str language_named(str name) {
+    return ALIASES.get(name.trim().to_lower()).or("");
+}
+
+/// The language of a file, from its name: its extension, or the whole name
+/// for a Dockerfile. "" for anything else, which is shown plain.
+pub str language_of(str path) {
+    List<str> segments = path.split("/");
+    str name = segments[segments.size() - 1].to_lower();
+    if (name == "dockerfile" || name == "containerfile" || name.starts_with("dockerfile.") || name.ends_with(".dockerfile")) {
+        return "dockerfile";
+    }
+    List<str> pieces = name.split(".");
+    if (pieces.size() < 2) {
+        return "";
+    }
+    return language_named(pieces[pieces.size() - 1]);
+}
+
+// The rules of `language`, or None for one this module does not know.
+Option<Syntax> syntax_of(str language) {
+    Syntax found = Syntax(M31_WORDS);
+    if (language == "m31") {
+        found = Syntax(M31_WORDS, line_comments: ["//"], block_open: "/*", block_close: "*/", quotes: "\"'", is_capital_type: true);
+    } else if (language == "rust") {
+        found = Syntax(RUST_WORDS, line_comments: ["//"], block_open: "/*", block_close: "*/", long_quotes: "\"", is_capital_type: true);
+    } else if (language == "lua") {
+        found = Syntax(LUA_WORDS, line_comments: ["--"], block_open: "--[[", block_close: "]]", quotes: "\"'");
+    } else if (language == "shell") {
+        found = Syntax(SHELL_WORDS, line_comments: ["#"], is_comment_after_space: true, long_quotes: "\"", raw_quotes: "'");
+    } else if (language == "python") {
+        found = Syntax(PYTHON_WORDS, line_comments: ["#"], quotes: "\"'", is_triple_quoted: true);
+    } else if (language == "javascript") {
+        found = Syntax(JAVASCRIPT_WORDS, line_comments: ["//"], block_open: "/*", block_close: "*/", quotes: "\"'", long_quotes: "`", is_capital_type: true);
+    } else if (language == "c") {
+        found = Syntax(C_WORDS, line_comments: ["//"], block_open: "/*", block_close: "*/", quotes: "\"'");
+    } else if (language == "go") {
+        found = Syntax(GO_WORDS, line_comments: ["//"], block_open: "/*", block_close: "*/", quotes: "\"'", raw_quotes: "`");
+    } else if (language == "json") {
+        found = Syntax(DATA_WORDS, quotes: "\"");
+    } else if (language == "yaml") {
+        found = Syntax(DATA_WORDS, line_comments: ["#"], is_comment_after_space: true, quotes: "\"'");
+    } else if (language == "toml") {
+        found = Syntax(DATA_WORDS, line_comments: ["#"], quotes: "\"", raw_quotes: "'");
+    } else if (language == "dockerfile") {
+        found = Syntax(DOCKERFILE_WORDS, line_comments: ["#"], is_comment_after_space: true, quotes: "\"'");
+    } else {
+        return Option<Syntax>.None;
+    }
+    return Option<Syntax>.Some(found);
+}
+
+/// `source` as escaped HTML with its tokens in spans, for a `<pre>`. A
+/// language this module does not know, or a source over MAX_HIGHLIGHT, is
+/// only escaped.
+pub str highlight(str source, str language) {
+    bytes raw = source.to_bytes();
+    bytes out = [];
+    Option<Syntax> rules = Option<Syntax>.None;
+    if (raw.size() <= MAX_HIGHLIGHT) {
+        rules = syntax_of(language);
+    }
+    match (rules) {
+        case Some(Syntax syntax): {
+            tokenize(raw, syntax, out);
+        }
+        case None: {
+            put(out, raw, 0, raw.size());
+        }
+    }
+    match (out.utf8()) {
+        case Some(str markup): {
+            return markup;
+        }
+        case None: {
+            trap("highlight: escaping broke UTF-8");
+        }
+    }
+}
+
+// The one pass. `plain` is where the run of bytes outside any token began;
+// it is flushed, escaped, before each token.
+void tokenize(bytes raw, Syntax syntax, bytes out) {
+    int size = raw.size();
+    int plain = 0;
+    int index = 0;
+    bytes quotes = syntax.quotes.to_bytes();
+    bytes long_quotes = syntax.long_quotes.to_bytes();
+    bytes raw_quotes = syntax.raw_quotes.to_bytes();
+    while (index < size) {
+        int octet = raw[index];
+        int stop = -1;
+        str kind = "";
+        bool is_word_boundary = index == 0 || !is_word_byte(raw[index - 1]);
+        if (syntax.block_open != "" && is_at(raw, index, syntax.block_open)) {
+            stop = find(raw, index + syntax.block_open.size(), syntax.block_close);
+            kind = "hc";
+        } else if (is_line_comment(raw, index, syntax)) {
+            stop = line_end(raw, index);
+            kind = "hc";
+        } else if (syntax.is_triple_quoted && (is_at(raw, index, "\"\"\"") || is_at(raw, index, "'''"))) {
+            stop = string_end(raw, index + 3, raw.substr(index, index + 3), true, true);
+            kind = "hs";
+        } else if (has_byte(quotes, octet)) {
+            stop = string_end(raw, index + 1, [octet], true, false);
+            kind = "hs";
+        } else if (has_byte(long_quotes, octet)) {
+            stop = string_end(raw, index + 1, [octet], true, true);
+            kind = "hs";
+        } else if (has_byte(raw_quotes, octet)) {
+            stop = string_end(raw, index + 1, [octet], false, true);
+            kind = "hs";
+        } else if (is_digit(octet) && is_word_boundary) {
+            stop = index + 1;
+            while (stop < size && (is_word_byte(raw[stop]) || (raw[stop] == '.' && stop + 1 < size && is_digit(raw[stop + 1])))) {
+                stop = stop + 1;
+            }
+            kind = "hn";
+        } else if (is_word_start(octet) && is_word_boundary) {
+            stop = index + 1;
+            while (stop < size && is_word_byte(raw[stop])) {
+                stop = stop + 1;
+            }
+            kind = word_class(raw, index, stop, syntax);
+            if (kind == "") {
+                // A word the table does not know: plain, and stepped over
+                // whole so a digit inside it is not taken for a number.
+                index = stop;
+                continue;
+            }
+        }
+        if (kind == "") {
+            index = index + 1;
+            continue;
+        }
+        put(out, raw, plain, index);
+        out.extend(("<span class=\"" + kind + "\">").to_bytes());
+        put(out, raw, index, stop);
+        out.extend("</span>".to_bytes());
+        index = stop;
+        plain = stop;
+    }
+    put(out, raw, plain, size);
+}
+
+// "hk", "ht" or "" for the identifier `raw[from .. until]`.
+str word_class(bytes raw, int from, int until, Syntax syntax) {
+    match (raw.substr(from, until).utf8()) {
+        case Some(str word): {
+            int found = syntax.words.get(word).or(0);
+            if (found == KEYWORD) {
+                return "hk";
+            }
+            if (found == TYPE || (syntax.is_capital_type && raw[from] >= 'A' && raw[from] <= 'Z')) {
+                return "ht";
+            }
+            return "";
+        }
+        case None: {
+            return "";
+        }
+    }
+}
+
+bool is_line_comment(bytes raw, int index, Syntax syntax) {
+    for (str marker in syntax.line_comments) {
+        if (is_at(raw, index, marker)) {
+            if (!syntax.is_comment_after_space || index == 0) {
+                return true;
+            }
+            int before = raw[index - 1];
+            return before == ' ' || before == '\t' || before == '\n' || before == ';';
+        }
+    }
+    return false;
+}
+
+// Where a string whose body starts at `from` ends: just past its closing
+// `quote`; at the end of its line, for a kind that may not span lines; or at
+// the end of the source.
+int string_end(bytes raw, int from, bytes quote, bool has_escapes, bool is_multiline) {
+    int size = raw.size();
+    int index = from;
+    while (index < size) {
+        int octet = raw[index];
+        if (has_escapes && octet == '\\') {
+            index = index + 2;
+            continue;
+        }
+        if (octet == '\n' && !is_multiline) {
+            return index;
+        }
+        if (octet == quote[0] && index + quote.size() <= size && raw.substr(index, index + quote.size()) == quote) {
+            return index + quote.size();
+        }
+        index = index + 1;
+    }
+    return size;
+}
+
+// Just past the first `needle` at or after `from`, or the end of the source.
+int find(bytes raw, int from, str needle) {
+    int index = from;
+    while (index < raw.size()) {
+        if (is_at(raw, index, needle)) {
+            return index + needle.size();
+        }
+        index = index + 1;
+    }
+    return raw.size();
+}
+
+int line_end(bytes raw, int from) {
+    int index = from;
+    while (index < raw.size() && raw[index] != '\n') {
+        index = index + 1;
+    }
+    return index;
+}
+
+bool is_at(bytes raw, int index, str needle) {
+    int size = needle.size();
+    if (index + size > raw.size()) {
+        return false;
+    }
+    for (int i in 0 .. size) {
+        if (raw[index + i] != needle.byte_at(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool has_byte(bytes candidates, int octet) {
+    for (int candidate in candidates) {
+        if (candidate == octet) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_digit(int octet) {
+    return octet >= '0' && octet <= '9';
+}
+
+bool is_word_start(int octet) {
+    return (octet >= 'a' && octet <= 'z') || (octet >= 'A' && octet <= 'Z') || octet == '_';
+}
+
+bool is_word_byte(int octet) {
+    return is_word_start(octet) || is_digit(octet);
+}
+
+/// `raw[from .. until]` appended to `out`, HTML-escaped as `HOARD_html.escape`
+/// escapes text. Byte by byte, so a range that cuts a character is harmless.
+pub void put(bytes out, bytes raw, int from, int until) {
+    int start = from;
+    for (int i in from .. until) {
+        str entity = "";
+        int octet = raw[i];
+        if (octet == '&') {
+            entity = "&amp;";
+        } else if (octet == '<') {
+            entity = "&lt;";
+        } else if (octet == '>') {
+            entity = "&gt;";
+        } else if (octet == '"') {
+            entity = "&quot;";
+        } else if (octet == '\'') {
+            entity = "&#x27;";
+        }
+        if (entity != "") {
+            out.extend(raw.substr(start, i));
+            out.extend(entity.to_bytes());
+            start = i + 1;
+        }
+    }
+    out.extend(raw.substr(start, until));
+}
