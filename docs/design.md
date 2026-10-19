@@ -12,12 +12,12 @@ The same feature set as orogit, nothing more in 0.1:
 | Area | Behaviour |
 |---|---|
 | Transport | Git smart HTTP through `git http-backend`, streamed both ways in constant memory. No SSH. |
-| Auth | HTTP Basic. Passwords stored as SHA-512-crypt (`$6$`) hashes. |
+| Auth | HTTP Basic. Passwords stored as SHA-512-crypt (`$6$`) hashes. Per-user access tokens (read or write scope) work wherever a password does, so scripts and CI never hold a password. |
 | Permissions | Per repository: public flag, readers, writers. A user without access gets 404, never 403, so private names cannot be probed. A reader who tries to push gets 403. |
 | Damping | Failed logins counted per client address (walked back through trusted proxies in `X-Forwarded-For`). Five failures in 10 minutes lock the address out for 60 s, doubling per further failure, capped at 15 min. Each failure is answered 250 ms late. |
 | Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary, log, files, one page per file and per commit. |
 | Index | `/` lists the repositories the requester may read; `/?login` asks for credentials. |
-| Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`. |
+| Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`; hoard adds `-token [--read-only]`, `-tokens`, `-revoke-token`. |
 
 URL layout (unchanged from orogit):
 
@@ -28,7 +28,9 @@ URL layout (unchanged from orogit):
 ```
 
 The config file has orogit's schema, so an orogit install moves over by
-copying `orogit.json` to `hoard.json`. The `oro` key is ignored.
+copying `orogit.json` to `hoard.json`. The `oro` key is ignored. Access
+tokens sit under their user beside `hash`, the only key orogit reads, so the
+file stays readable by orogit.
 
 ```json
 {
@@ -37,7 +39,8 @@ copying `orogit.json` to `hoard.json`. The `oro` key is ignored.
   "pages_root": "pages",
   "base_url": "https://git.example.org",
   "trusted_proxies": ["127.0.0.1"],
-  "users": {"alice": {"hash": "$6$salt$..."}},
+  "users": {"alice": {"hash": "$6$salt$...",
+                      "tokens": {"ci": {"sha256": "<64 hex>", "scope": "read", "created": "2026-10-18"}}}},
   "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}}
 }
 ```
@@ -61,6 +64,7 @@ hoard.m31                entry: the command line (lib/args), dispatch
 core/HOARD_store.m31     config: names, load, normalise, permissions, atomic save, lock
 core/HOARD_addr.m31      client address through trusted proxies (IPv4 CIDR, exact v6)
 core/HOARD_crypt.m31     SHA-512-crypt hash and verify, constant-time compare
+core/HOARD_token.m31     access tokens: make, digest, find
 core/HOARD_auth.m31      Basic credentials, the guard thread (cache and damping)
 core/HOARD_server.m31    accept loop, worker pool, request loop, routing, index, pages
 core/HOARD_cgi.m31       git http-backend as streamed CGI
@@ -160,6 +164,31 @@ subprocesses.
   (a dummy hash is verified), so user names cannot be found by timing.
 - Passwords come from stdin, never argv. A password with a line break or NUL,
   an empty one, or one over 1024 bytes is refused.
+
+### 3.6 Access tokens
+
+- `-token USER NAME [--read-only]` makes `hoard_` plus 64 hex digits: 32
+  octets from `random.system()`, which is getrandom(2) (getentropy(3) off
+  Linux), the kernel's CSPRNG. The token is printed once, on stdout, after
+  the config is saved; nothing else ever shows it. `-tokens USER` lists name,
+  scope and date; `-revoke-token USER NAME` deletes one; `-deluser` deletes
+  them all.
+- The config keeps only the token's SHA-256. Salt and crypt rounds exist to
+  slow guesses at a password a person chose; 256 random bits cannot be
+  searched however fast each guess is, so a stretched hash would cost every
+  request 30 ms and buy nothing.
+- A Basic password of a token's shape (`hoard_` and 64 lowercase hex digits)
+  is checked against that user's token digests only, in constant time and
+  without stopping at a match, never against the crypt hash. `-adduser` and
+  `-passwd` refuse a password of that shape, since it could never log in.
+- A user with no tokens, or no such user, is compared with a dummy digest:
+  the token path, like the password path, costs the same whether the user
+  exists.
+- A wrong token is a failed login: 401, counted toward the address's damping
+  like a wrong password.
+- A token is its user, never more: grants are the user's. A read-only token
+  is its user without the writes, so a push with one is a 403, as a reader's
+  is.
 - The config is saved to `<config>.tmp` with mode 0600, then renamed over the
   config.
 - Every generated page carries `Content-Security-Policy: default-src 'none';
@@ -171,7 +200,8 @@ subprocesses.
 
 - Unit tests (`tests/t_*.m31`): names, config normalisation, permissions,
   address walking and CIDR, SHA-512-crypt against vectors from
-  `openssl passwd -6`, Basic credential parsing, CGI head parsing, escaping.
+  `openssl passwd -6`, Basic credential parsing, CGI head parsing, escaping,
+  access tokens and their place in the config.
 - End to end (`tests/e2e.sh`): orogit's 120 checks, ported. A real `git`
   client against a server on a free port with a temp config: public versus
   private, refused pushes, a 100 MB push with RSS measured, concurrent clones

@@ -1004,6 +1004,144 @@ get "/priv.git/info/refs?service=git-upload-pack" -u "bob:a new password" -H "X-
 check "the address the trusted proxy appended is" $? "status $ST"
 hc -proxies --set 127.0.0.1
 
+# --- hoard: access tokens --------------------------------------------------------------------
+
+section "hoard: access tokens"
+sha256_of() { python3 -I -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"; }
+is_token() { printf '%s' "$1" | grep -E -q '^hoard_[0-9a-f]{64}$'; }
+hc -token alice ci-write
+WTOK=$(cat "$T/cli.out")
+[ "$RC" = 0 ] && [ "$(wc -l <"$T/cli.out" | tr -d ' ')" = 1 ] && [ ! -s "$T/cli.err" ] && is_token "$WTOK"
+check "-token prints one hoard_ token on stdout and nothing else" $? "rc $RC: $(err1)"
+hc -token alice ci-read --read-only
+RTOK=$(cat "$T/cli.out")
+is_token "$RTOK" && [ "$RTOK" != "$WTOK" ]
+check "-token --read-only makes a second, different token" $? "rc $RC: $(err1)"
+hc -token bob bob-ci
+BTOK=$(cat "$T/cli.out")
+is_token "$BTOK"
+check "a reader may have a write token too" $? "rc $RC: $(err1)"
+plain=0
+for tok in "$WTOK" "$RTOK" "$BTOK"; do
+    grep -F -q -- "$tok" "$CFG" && plain=1
+    grep -F -q -- "${tok#hoard_}" "$CFG" && plain=1
+done
+[ "$plain" = 0 ]
+check "the config holds no token in plaintext" $?
+[ "$(py config_get "$CFG" users.alice.tokens.ci-read.sha256)" = "\"$(sha256_of "$RTOK")\"" ] \
+    && [ "$(py config_get "$CFG" users.alice.tokens.ci-read.scope)" = '"read"' ] \
+    && [ "$(py config_get "$CFG" users.alice.tokens.ci-write.scope)" = '"write"' ] \
+    && py config_get "$CFG" users.alice.tokens.ci-read.created | grep -E -q '^"[0-9]{4}-[0-9]{2}-[0-9]{2}"$'
+check "the config keeps each token's SHA-256, scope and date under its user" $? "$(py config_get "$CFG" users.alice.tokens)"
+py config_get "$CFG" users.alice.hash | grep -q '^"\$6\$'
+check "the user's hash stays where orogit reads it" $?
+hc -tokens alice
+[ "$RC" = 0 ] && [ "$(cut -d' ' -f1,2 "$T/cli.out")" = "ci-read read
+ci-write write" ] && ! grep -q "hoard_" "$T/cli.out"
+check "-tokens lists names, scopes and dates, never a token" $? "rc $RC: $(cat "$T/cli.out")"
+hc -token alice ci-write
+[ "$RC" = 1 ] && grep -q "already has a token" "$T/cli.err" && [ ! -s "$T/cli.out" ]
+check "-token refuses a name the user already has, and prints nothing" $? "rc $RC: $(err1)"
+hc -token nobody ci
+[ "$RC" = 1 ] && grep -q "no user" "$T/cli.err"
+check "-token refuses an unknown user" $? "rc $RC: $(err1)"
+hc -token alice "bad name"
+[ "$RC" = 1 ] && grep -q "invalid token name" "$T/cli.err"
+check "-token refuses a malformed name" $? "rc $RC: $(err1)"
+hc_in "$RTOK" -passwd alice
+[ "$RC" = 1 ] && grep -q "form of an access token" "$T/cli.err"
+check "a password of a token's shape is refused" $? "rc $RC: $(err1)"
+
+g clone -q "$(aurl "alice:$WTOK" /priv.git)" "$WORK/t1"
+check "clone of a private repository with a write token" $? "$(gerr)"
+g clone -q "$(aurl "alice:$RTOK" /priv.git)" "$WORK/t2"
+check "clone with a read-only token" $? "$(gerr)"
+TSHA=$(commit_file "$WORK/t1" token.txt "pushed with a token
+" "token push")
+g -C "$WORK/t1" push "$(aurl "alice:$WTOK" /priv.git)" main
+[ $? = 0 ] && [ "$(git --git-dir "$(bare priv)" rev-parse refs/heads/main 2>/dev/null)" = "$TSHA" ]
+check "push with a write token" $? "$(glast)"
+BEFORE_PRIV=$(refs_of priv)
+commit_file "$WORK/t2" nope.txt "never
+" "read-only push" >/dev/null
+g -C "$WORK/t2" push "$(aurl "alice:$RTOK" /priv.git)" main
+rc=$?
+[ $rc != 0 ] && grep -q "403" "$T/git.err" && [ "$(refs_of priv)" = "$BEFORE_PRIV" ]
+check "push with a read-only token is refused with 403, refs unchanged" $? "$(glast)"
+req POST /priv.git/git-receive-pack -u "alice:$RTOK" -d 0000
+[ "$ST" = 403 ]
+check "POST git-receive-pack with a read-only token is 403" $? "status $ST"
+get "/priv.git/info/refs?service=git-upload-pack" -u "bob:$BTOK"
+s1=$ST
+req POST /priv.git/git-receive-pack -u "bob:$BTOK" -d 0000
+[ "$s1" = 200 ] && [ "$ST" = 403 ]
+check "a reader's write token reads but cannot push (403)" $? "read $s1, push $ST"
+hc -addrepo alicepriv -grant alicepriv alice write
+get "/alicepriv.git/info/refs?service=git-upload-pack" -u "bob:$BTOK"
+s1=$ST
+get /alicepriv/ -u "bob:$BTOK"
+[ "$s1" = 404 ] && [ "$ST" = 404 ]
+check "bob's token gets 404 for alice's private repository" $? "git $s1, pages $ST"
+get / -u "alice:$WTOK"
+[ "$ST" = 200 ] && body_has alicepriv
+check "a token works on the index like a password" $? "status $ST"
+XT="X-Forwarded-For: 10.6.6.1"
+get "/priv.git/info/refs?service=git-upload-pack" -u "bob:$WTOK" -H "$XT"
+[ "$ST" = 401 ]
+check "a token logs in only as its own user" $? "status $ST"
+get "/priv.git/info/refs?service=git-upload-pack" -u "nobody:$WTOK" -H "$XT"
+[ "$ST" = 401 ]
+check "a token for a user that does not exist is 401" $? "status $ST"
+
+XD="X-Forwarded-For: 10.6.6.2"
+statuses=""
+all401=0
+for _ in 1 2 3 4 5; do
+    get "/priv.git/info/refs?service=git-upload-pack" -u "alice:hoard_0000000000000000000000000000000000000000000000000000000000000000" -H "$XD"
+    statuses="$statuses $ST"
+    [ "$ST" = 401 ] || all401=1
+done
+check "five wrong tokens are 401" $all401 "$statuses"
+get "/priv.git/info/refs?service=git-upload-pack" -u "alice:$WTOK" -H "$XD"
+[ "$ST" = 429 ]
+check "wrong tokens count toward damping: then even a good token is 429" $? "status $ST"
+
+XR="X-Forwarded-For: 10.6.6.3"
+hc -revoke-token alice ci-write
+rc=$RC
+get "/priv.git/info/refs?service=git-upload-pack" -u "alice:$WTOK" -H "$XR"
+s1=$ST
+get "/priv.git/info/refs?service=git-upload-pack" -u "alice:$RTOK" -H "$XR"
+[ "$rc" = 0 ] && [ "$s1" = 401 ] && [ "$ST" = 200 ]
+check "a revoked token is 401 at once; the user's other token still works" $? "rc $rc, revoked $s1, other $ST"
+hc -tokens alice
+[ "$(cut -d' ' -f1 "$T/cli.out")" = ci-read ]
+check "-tokens no longer lists the revoked token" $? "$(cat "$T/cli.out")"
+hc -revoke-token alice ci-write
+[ "$RC" = 1 ] && grep -q "has no token" "$T/cli.err"
+check "-revoke-token refuses a token that is not there" $? "rc $RC: $(err1)"
+hc -grant pub bob read
+py config_get "$CFG" users.alice.tokens.ci-read.scope | grep -q read
+check "an unrelated save keeps the tokens (config round trip)" $?
+
+hc_in "dave-pw" -adduser dave
+hc -token dave laptop
+DTOK=$(cat "$T/cli.out")
+get / -u "dave:$DTOK" -H "$XR"
+s1=$ST
+hc -deluser dave
+get / -u "dave:$DTOK" -H "$XR"
+s2=$ST
+[ "$s1" = 200 ] && [ "$s2" = 401 ] && [ "$(py config_get "$CFG" users.dave)" = null ]
+check "deluser removes the user's tokens" $? "before $s1, after $s2"
+hc_in "dave-pw" -adduser dave
+hc -tokens dave
+rc=$RC
+get / -u "dave:$DTOK" -H "$XR"
+[ "$rc" = 0 ] && [ ! -s "$T/cli.out" ] && [ "$ST" = 401 ]
+check "a user added again under the same name does not get the old tokens back" $? "rc $rc, status $ST"
+hc -deluser dave
+
 # --- 12: a config save is atomic -----------------------------------------------------------
 
 section "12. a config save is atomic"

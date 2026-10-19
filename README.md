@@ -33,7 +33,9 @@ hoard --config data/hoard.json -serve --workers 16
 | `-init [--listen ADDR] [--base-url URL]` | create the config, `repos/`, `pages/` and `hooks/post-receive` |
 | `-serve [--listen ADDR] [--workers N]` | run the server |
 | `-adduser NAME`, `-passwd NAME` | add a user, change a password; the password is read from stdin |
-| `-deluser NAME` | remove a user and all their grants |
+| `-deluser NAME` | remove a user and all their grants and tokens |
+| `-token USER NAME [--read-only]` | make an access token and print it, once |
+| `-tokens USER`, `-revoke-token USER NAME` | list a user's tokens (name, scope, date), delete one |
 | `-addrepo NAME [--public]` | create a bare repository |
 | `-adopt NAME [--public]` | take over an existing `repos/NAME.git` (moving from orogit) |
 | `-grant REPO USER read\|write`, `-revoke REPO USER` | permissions |
@@ -45,6 +47,16 @@ hoard --config data/hoard.json -serve --workers 16
 The config file defaults to `$HOARD_CONFIG`, then `./hoard.json`. Several
 commands may share one line; the whole line is checked before any of it runs.
 Usage errors exit 64, other failures 1.
+
+Access tokens are for scripts and CI: a token works wherever the user's
+password does (HTTP Basic, user name plus token), carries no more than the
+user's grants, and with `--read-only` cannot push. Only its SHA-256 is kept,
+so it is shown once:
+
+```
+TOKEN=$(hoard --config data/hoard.json -token alice ci --read-only)
+git clone "https://alice:$TOKEN@git.example.org/site.git"
+```
 
 Moving from orogit: copy `orogit.json` to `hoard.json` and the `repos/`
 directory beside it, run `-init` in a fresh directory to get the hook, then
@@ -76,6 +88,7 @@ hoard.m31              the command line
 core/HOARD_store.m31   config, permissions, atomic save, admin lock
 core/HOARD_addr.m31    client address through trusted proxies
 core/HOARD_crypt.m31   SHA-512-crypt
+core/HOARD_token.m31   access tokens
 core/HOARD_auth.m31    Basic credentials; the guard thread (cache, damping)
 core/HOARD_server.m31  accept loop, workers, routing, index, page serving
 core/HOARD_cgi.m31     git http-backend, streamed
