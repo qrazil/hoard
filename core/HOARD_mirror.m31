@@ -1,0 +1,206 @@
+// Push mirroring: after every push a repository is pushed on to a second
+// remote -- in practice GitHub, as an off-site backup and a public copy.
+//
+// The config names the remote per repository and, for one that needs a
+// login, the environment variable that holds the token:
+//
+//     "site": {"public": true, "readers": [], "writers": ["alice"],
+//              "mirror": {"url": "https://github.com/owner/site.git",
+//                         "token_env": "HOARD_GITHUB_TOKEN"}}
+//
+// The token is never in the config, on a command line, in a log or in the
+// URL. It is read from hoard's own environment and reaches git through a
+// credential helper that is a shell function, given on git's command line
+// with `-c`. The function's text names only a variable,
+// `$HOARD_MIRROR_TOKEN`, which is set in git's environment; the shell
+// expands it and prints it with the `printf` builtin, so no process is ever
+// started with the token in its argv, where `ps` shows it to every user. An
+// environment is readable only by the same user (and root). GIT_ASKPASS
+// pointing back at hoard would work as well, but needs a hidden mode in the
+// command line and one more exec per prompt for the same result. The helper
+// list is emptied first, so a helper in the user's git config never sees
+// (or stores) the token.
+//
+// The user name sent with the token is `x-access-token` unless the mirror
+// sets `"user"`: GitHub takes any name with a personal access token and
+// wants exactly that one with an app installation token; another hoard
+// wants a real user.
+//
+// What is pushed: refs/heads/* and refs/tags/*, forced, with `--prune` --
+// a branch or tag deleted here is deleted there. Not `--mirror`: that also
+// pushes and prunes every other ref, and GitHub keeps refs/pull/* that it
+// refuses to delete, so every mirror push would end in errors.
+//
+// When: the post-receive hook starts `-mirror-now --hook` in the background
+// after the pages are rebuilt, so a push never waits for, or fails because
+// of, its mirror; the outcome is appended to `mirror.log` beside the config.
+// Two pushes close together each start one. They take a lock directory in
+// the repository one after the other, and each pushes the refs as they are
+// when it gets the lock, so the last to run sends the newest refs: an older
+// push can never finish after a newer one and rewind the mirror.
+
+import core.HOARD_store;
+import fs;
+import io;
+import os;
+import proc;
+import timer;
+
+const int PUSH_TIMEOUT_MS = 600000;
+// Longer than one push may take, so a waiting push outlasts the one before.
+const int LOCK_WAIT_MS = 660000;
+const int LOCK_POLL_MS = 250;
+const str DEFAULT_USER = "x-access-token";
+// Answers git's `get` with the user and the token from the environment and
+// says nothing to `store` or `erase`.
+const str HELPER = "!f() { if [ \"$1\" = get ]; then printf 'username=%s\\npassword=%s\\n' \"$HOARD_MIRROR_USER\" \"$HOARD_MIRROR_TOKEN\"; fi; }; f";
+
+/// Whether repository `name` exists and has a mirror.
+pub bool has_mirror(HOARD_store.Config config, str name) {
+    match (config.repos.get(name)) {
+        case Some(HOARD_store.Repo entry): {
+            return entry.mirror_url != "";
+        }
+        case None: {
+            return false;
+        }
+    }
+}
+
+/// The user name sent with the token.
+pub str user_of(HOARD_store.Repo entry) {
+    if (entry.mirror_user != "") {
+        return entry.mirror_user;
+    }
+    return DEFAULT_USER;
+}
+
+/// Push repository `name` to its mirror now. The line to report on success;
+/// the reason on failure, which never holds the token.
+pub Result<str, str> push(str config_path, str name) {
+    HOARD_store.Config config = HOARD_store.load(config_path)?;
+    HOARD_store.Repo entry = HOARD_store.Repo(false, [], []);
+    match (config.repos.get(name)) {
+        case Some(HOARD_store.Repo found): {
+            entry = found;
+        }
+        case None: {
+            return Result<str, str>.Err("no repository '" + name + "'");
+        }
+    }
+    if (entry.mirror_url == "") {
+        return Result<str, str>.Err("repository '" + name + "' has no mirror; set one with -mirror " + name + " URL");
+    }
+    str label = "mirror " + name + " -> " + entry.mirror_url;
+    Map<str, str> env = git_env();
+    str token = "";
+    if (entry.mirror_token_env != "") {
+        token = os.env(entry.mirror_token_env).or("");
+        if (token == "") {
+            return Result<str, str>.Err(label + ": the environment variable " + entry.mirror_token_env + " is not set or empty, so there is no token");
+        }
+        // A line break would end the credential helper's answer early.
+        if (token.contains("\n") || token.contains("\r")) {
+            return Result<str, str>.Err(label + ": the token in " + entry.mirror_token_env + " holds a line break");
+        }
+        env.set("HOARD_MIRROR_TOKEN", token);
+        env.set("HOARD_MIRROR_USER", user_of(entry));
+    }
+    str git_directory = HOARD_store.repo_git_directory(config, config_path, name);
+    List<str> argv = ["git", "--git-dir", git_directory];
+    if (token != "") {
+        List<str> helper = ["-c", "credential.helper=", "-c", "credential.helper=" + HELPER];
+        for (str word in helper) {
+            argv.push(word);
+        }
+    }
+    List<str> pushing = ["push", "--prune", "--quiet", entry.mirror_url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
+    for (str word in pushing) {
+        argv.push(word);
+    }
+    str lock_path = fs.join(git_directory, "hoard-mirror.lock");
+    take_lock(lock_path, label)?;
+    int started_ns = timer.monotonic_ns();
+    Result<str, str> outcome = run_push(argv, env, token, label);
+    release_lock(lock_path);
+    match (outcome) {
+        case Ok(str line): {
+            int elapsed_ms = (timer.monotonic_ns() - started_ns) / 1000000;
+            return Result<str, str>.Ok(line + " (" + elapsed_ms.to_str() + " ms)");
+        }
+        case Err(str problem): {
+            return Result<str, str>.Err(problem);
+        }
+    }
+}
+
+Result<str, str> run_push(List<str> argv, Map<str, str> env, str token, str label) {
+    match (proc.run(argv, env: Option<Map<str, str>>.Some(env), timeout_ms: PUSH_TIMEOUT_MS, should_check: false, is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (done.is_success()) {
+                return Result<str, str>.Ok(label + ": pushed");
+            }
+            str said = redact(done.stderr.utf8().or("").trim(), token).split("\n").join("; ");
+            return Result<str, str>.Err(label + ": git push failed: " + said);
+        }
+        case Err(proc.Error failure): {
+            return Result<str, str>.Err(label + ": git push: " + redact(failure.to_str(), token));
+        }
+    }
+}
+
+// git does not print credentials, but a remote's own message might echo
+// one; whatever is logged has the token cut out.
+str redact(str text, str token) {
+    if (token == "") {
+        return text;
+    }
+    return text.split(token).join("<token>");
+}
+
+// The environment git runs in: PATH and HOME only, as for the pages, and
+// never a prompt -- there is nobody to answer it.
+Map<str, str> git_env() {
+    Map<str, str> env = {"PATH": os.env("PATH").or("/usr/local/bin:/usr/bin:/bin"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"};
+    match (os.env("HOME")) {
+        case Some(str home): {
+            env.set("HOME", home);
+        }
+        case None: {
+        }
+    }
+    return env;
+}
+
+// Wait for the repository's mirror lock (a directory, created atomically by
+// `mkdir`). A lock still held after any push could have ended is reported
+// with the path to remove, never broken silently.
+Result<void, str> take_lock(str path, str label) {
+    int waited_ms = 0;
+    while (true) {
+        match (fs.mkdir(path)) {
+            case Ok(bool is_made): {
+                return Result<void, str>.Ok;
+            }
+            case Err(io.Error failure): {
+                if (!fs.is_directory(path)) {
+                    return Result<void, str>.Err(label + ": could not create " + path + ": " + failure.to_str());
+                }
+            }
+        }
+        if (waited_ms >= LOCK_WAIT_MS) {
+            return Result<void, str>.Err(label + ": another mirror push holds " + path + "; if none is running, remove it with: rmdir " + path);
+        }
+        timer.sleep_ms(LOCK_POLL_MS);
+        waited_ms = waited_ms + LOCK_POLL_MS;
+    }
+}
+
+void release_lock(str path) {
+    match (fs.rmdir(path)) {
+        case Ok(bool is_removed): {
+        }
+        case Err(io.Error failure): {
+        }
+    }
+}

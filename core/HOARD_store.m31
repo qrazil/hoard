@@ -11,7 +11,8 @@
 //       "trusted_proxies": ["127.0.0.1"],
 //       "users": {"alice": {"hash": "$6$salt$...",
 //                           "tokens": {"ci": {"sha256": "...", "scope": "read", "created": "2026-10-18"}}}},
-//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}},
+//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"],
+//                           "mirror": {"url": "https://github.com/o/hello.git", "token_env": "GH_TOKEN"}}},
 //       "gc_hours": 24
 //     }
 //
@@ -30,6 +31,12 @@ pub type Repo {
     pub bool is_public;
     pub List<str> readers;
     pub List<str> writers;
+    // The push mirror (HOARD_mirror): the remote's URL, "" for none; the
+    // environment variable holding its token, "" for none; and the user name
+    // sent with the token, "" for the default.
+    pub str mirror_url = "";
+    pub str mirror_token_env = "";
+    pub str mirror_user = "";
 }
 
 /// An access token as stored: never the token, only its SHA-256 (HOARD_token).
@@ -127,6 +134,80 @@ pub bool is_sha256_hex(str text) {
         }
     }
     return true;
+}
+
+/// A push mirror's URL: http(s) or file, no spaces or control bytes, and no
+/// password in it -- the token comes from `token_env` and is never written
+/// down. ssh is not offered: the post-receive hook runs without `$HOME`, so
+/// it would find no keys.
+pub str mirror_url_problem(str url) {
+    if (url.size() == 0 || url.size() > 2048) {
+        return "the mirror URL is empty or longer than 2048 bytes";
+    }
+    for (int index in 0 .. url.size()) {
+        int byte = url.byte_at(index);
+        if (byte <= 32 || byte == 127) {
+            return "the mirror URL holds a space or a control character";
+        }
+    }
+    int start = 0;
+    List<str> schemes = ["https://", "http://", "file://"];
+    for (str scheme in schemes) {
+        if (url.starts_with(scheme)) {
+            start = scheme.size();
+        }
+    }
+    if (start == 0) {
+        return "the mirror URL must start with https://, http:// or file://";
+    }
+    str rest = url.substr(start, url.size());
+    str authority = rest;
+    match (rest.index_of("/")) {
+        case Some(int slash): {
+            authority = rest.substr(0, slash);
+        }
+        case None: {
+        }
+    }
+    if (authority.contains("@")) {
+        return "the mirror URL holds a user name or password; give the token with --token-env (and the user with --user) instead";
+    }
+    return "";
+}
+
+/// An environment variable name: letters, digits and `_`, not starting with
+/// a digit. Names git reads itself (`GIT_*`) are refused, because the
+/// variable is passed to git's receive-pack (HOARD_cgi).
+pub bool is_valid_env_name(str name) {
+    if (name.size() == 0 || name.size() > 128 || name.starts_with("GIT_")) {
+        return false;
+    }
+    for (int index in 0 .. name.size()) {
+        int byte = name.byte_at(index);
+        bool is_letter = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || byte == '_';
+        if (!is_letter && !(index > 0 && byte >= '0' && byte <= '9')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Why a mirror setting is unusable, or "" when it is fine.
+pub str mirror_problem(str url, str token_env, str user) {
+    str problem = mirror_url_problem(url);
+    if (problem != "") {
+        return problem;
+    }
+    if (token_env != "" && !is_valid_env_name(token_env)) {
+        return "the token variable '" + token_env + "' is not an environment variable name (letters, digits, '_'; not GIT_*)";
+    }
+    if (user != "" && token_env == "") {
+        return "a mirror user needs a token variable";
+    }
+    if (user != "" && !is_valid_user_name(user)) {
+        return "invalid mirror user name '" + user + "'";
+    }
+    return "";
 }
 
 // --- paths -------------------------------------------------------------------
@@ -303,7 +384,20 @@ pub Result<Config, str> parse(str text) {
                 json.Value entry = repos.get(name).or(json.Value.Null);
                 if (is_valid_repo_name(name) && object_of(entry).is_some()) {
                     bool is_public = is_true(member(entry, "public"));
-                    config.repos.set(name, Repo(is_public, names_of(member(entry, "readers")), names_of(member(entry, "writers"))));
+                    Repo parsed = Repo(is_public, names_of(member(entry, "readers")), names_of(member(entry, "writers")));
+                    // A mirror that is there but unusable is an error, not
+                    // dropped: a backup that silently stops is worse.
+                    json.Value mirror = member(entry, "mirror");
+                    if (object_of(mirror).is_some()) {
+                        parsed.mirror_url = text_of(member(mirror, "url"), "");
+                        parsed.mirror_token_env = text_of(member(mirror, "token_env"), "");
+                        parsed.mirror_user = text_of(member(mirror, "user"), "");
+                        str problem = mirror_problem(parsed.mirror_url, parsed.mirror_token_env, parsed.mirror_user);
+                        if (problem != "") {
+                            return Result<Config, str>.Err("repository '" + name + "': " + problem);
+                        }
+                    }
+                    config.repos.set(name, parsed);
                 }
             }
         } else {
@@ -521,6 +615,19 @@ pub bool can_write(Config config, str repo, str user) {
     }
 }
 
+/// The environment variable the repository's mirror takes its token from,
+/// or "" when there is none.
+pub str mirror_token_env(Config config, str repo) {
+    match (config.repos.get(repo)) {
+        case Some(Repo entry): {
+            return entry.mirror_token_env;
+        }
+        case None: {
+            return "";
+        }
+    }
+}
+
 // --- saving ------------------------------------------------------------------
 
 /// The config as the JSON text `save` writes: keys sorted, two-space indent.
@@ -569,6 +676,16 @@ pub Result<str, str> render(Config config) {
         match (config.repos.get(name)) {
             case Some(Repo entry): {
                 Map<str, json.Value> fields = {"public": json.Value.Bool(entry.is_public), "readers": json.Value.Array(strings(entry.readers)), "writers": json.Value.Array(strings(entry.writers))};
+                if (entry.mirror_url != "") {
+                    Map<str, json.Value> mirror = {"url": json.Value.Str(entry.mirror_url)};
+                    if (entry.mirror_token_env != "") {
+                        mirror.set("token_env", json.Value.Str(entry.mirror_token_env));
+                    }
+                    if (entry.mirror_user != "") {
+                        mirror.set("user", json.Value.Str(entry.mirror_user));
+                    }
+                    fields.set("mirror", json.Value.Object(mirror));
+                }
                 repos.set(name, json.Value.Object(fields));
             }
             case None: {

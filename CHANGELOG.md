@@ -36,3 +36,9 @@ First version: the m31 port of orogit.
   prints a `hoard_` token once, `-tokens` and `-revoke-token` manage them.
   Only a SHA-256 is stored, under the user in the config; a token logs in
   wherever the password does, never with more than the user's grants.
+- Push mirrors: `-mirror REPO URL [--token-env NAME] [--user NAME]` (or
+  `--off`) per repository; after every push its branches and tags are pushed
+  on in the background (`--prune`, not `--mirror`), logged to `mirror.log`,
+  never failing the push. The token comes from the server's environment
+  through a credential helper, never the config, argv or logs.
+  `-mirror-now REPO` pushes at once.
