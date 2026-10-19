@@ -809,7 +809,7 @@ check "...cacheable as immutable (public repository)" $? "$(header cache-control
 git -C "$W" archive --format=tar.gz --prefix=pub-v1.0/ v1.0 >"$T/local-v1.0.tar.gz"
 tar tzf "$T/pub-v1.0.tar.gz" >"$T/served.list" 2>/dev/null && tar tzf "$T/local-v1.0.tar.gz" >"$T/local.list" && cmp -s "$T/served.list" "$T/local.list"
 check "the tarball lists the same files as a local git archive" $? "$(diff "$T/served.list" "$T/local.list" 2>&1 | head -5)"
-tar xzOf "$T/pub-v1.0.tar.gz" pub-v1.0/README.md 2>/dev/null | cmp -s - "$W/README.md"
+tar xzOf "$T/pub-v1.0.tar.gz" pub-v1.0/README.md 2>/dev/null | cmp -s - <(git -C "$W" show v1.0:README.md)
 check "a file in the tarball is byte-identical" $?
 ! grep -q '^pub-v1.0/docs/' "$T/served.list"
 check "the tarball is of the tag, not of the branch tip" $? "$(head -5 "$T/served.list")"
