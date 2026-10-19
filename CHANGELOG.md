@@ -42,3 +42,8 @@ First version: the m31 port of orogit.
   never failing the push. The token comes from the server's environment
   through a credential helper, never the config, argv or logs.
   `-mirror-now REPO` pushes at once.
+- The summary page renders a Markdown README (a safe subset: raw HTML shown,
+  links only to http, https, mailto, fragments and the repository's own
+  files, images as links); file pages and README code blocks are
+  syntax-highlighted for m31, Rust, Lua, shell, Python, JS/TS, C/C++, Go,
+  JSON, YAML, TOML and Dockerfiles.

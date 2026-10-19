@@ -4,8 +4,10 @@
 
 // The stylesheet every page carries inline: the pages are served with
 // `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`,
-// so nothing is fetched from anywhere.
-const str CSS = "body{font-family:system-ui,sans-serif;max-width:72rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fff}a{color:#0645ad;text-decoration:none}a:hover{text-decoration:underline}nav{border-bottom:1px solid #ddd;padding:.5rem 0;margin-bottom:1rem}nav a{margin-right:1rem}table{border-collapse:collapse}td,th{padding:.15rem .75rem .15rem 0;text-align:left;vertical-align:top}th{border-bottom:1px solid #ddd}pre{background:#f6f8fa;padding:.75rem;overflow-x:auto;font-size:.85rem;line-height:1.35}code,pre,.mono{font-family:ui-monospace,monospace}.muted{color:#666}.a{color:#116329}.d{color:#b31d28}.h{color:#6f42c1}.num{text-align:right}";
+// so nothing is fetched from anywhere. The `h*` classes are the syntax
+// highlighting (HOARD_highlight); code blocks turn dark, with lighter token
+// colours, when the reader prefers a dark scheme.
+const str CSS = "body{font-family:system-ui,sans-serif;max-width:72rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fff}a{color:#0645ad;text-decoration:none}a:hover{text-decoration:underline}nav{border-bottom:1px solid #ddd;padding:.5rem 0;margin-bottom:1rem}nav a{margin-right:1rem}table{border-collapse:collapse}td,th{padding:.15rem .75rem .15rem 0;text-align:left;vertical-align:top}th{border-bottom:1px solid #ddd}pre{background:#f6f8fa;padding:.75rem;overflow-x:auto;font-size:.85rem;line-height:1.35}code,pre,.mono{font-family:ui-monospace,monospace}.muted{color:#666}.a{color:#116329}.d{color:#b31d28}.h{color:#6f42c1}.num{text-align:right}.readme{border-top:1px solid #ddd}.readme code{background:#f6f8fa;padding:0 .2rem}.readme pre code{padding:0}.readme blockquote{margin-left:0;padding-left:1rem;border-left:3px solid #ddd;color:#555}.readme td,.readme th{border:1px solid #ddd;padding:.2rem .5rem}.hk{color:#cf222e}.ht{color:#8250df}.hs{color:#0a3069}.hn{color:#0550ae}.hc{color:#6e7781;font-style:italic}@media (prefers-color-scheme:dark){pre,.readme code{background:#161b22;color:#e6edf3}.hk{color:#ff7b72}.ht{color:#d2a8ff}.hs{color:#a5d6ff}.hn{color:#79c0ff}.hc{color:#8b949e}.a{color:#7ee787}.d{color:#ffa198}.h{color:#d2a8ff}}";
 
 /// `text` made safe as HTML content and inside a quoted attribute: `&`, `<`,
 /// `>`, `"` and `'` become `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#x27;`.

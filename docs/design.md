@@ -15,7 +15,7 @@ The same feature set as orogit, nothing more in 0.1:
 | Auth | HTTP Basic. Passwords stored as SHA-512-crypt (`$6$`) hashes. Per-user access tokens (read or write scope) work wherever a password does, so scripts and CI never hold a password. |
 | Permissions | Per repository: public flag, readers, writers. A user without access gets 404, never 403, so private names cannot be probed. A reader who tries to push gets 403. |
 | Damping | Failed logins counted per client address (walked back through trusted proxies in `X-Forwarded-For`). Five failures in 10 minutes lock the address out for 60 s, doubling per further failure, capped at 15 min. Each failure is answered 250 ms late. |
-| Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary, log, files, one page per file and per commit. |
+| Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary (with the README, Markdown rendered safely), log, files, one page per file (syntax-highlighted) and per commit. |
 | Index | `/` lists the repositories the requester may read; `/?login` asks for credentials. |
 | Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-adopt`, `-delrepo --yes`, `-rename`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`, `-gc`, `-token [--read-only]`, `-tokens`, `-revoke-token`, `-mirror`, `-mirror-now`. |
 | Tarballs | `/<repo>/archive/<tag>.tar.gz`: a tag's source, made by `git archive` and streamed. Tags only. Not in orogit. |
@@ -80,8 +80,11 @@ core/HOARD_auth.m31      Basic credentials, the guard thread (cache and damping)
 core/HOARD_server.m31    accept loop, worker pool, request loop, routing, index, pages
 core/HOARD_cgi.m31       git http-backend as streamed CGI
 core/HOARD_archive.m31   tag tarballs: git archive, streamed
+core/HOARD_gc.m31        housekeeping: git gc every gc_hours
 core/HOARD_pages.m31     the page generator
 core/HOARD_mirror.m31    push mirrors: credential helper, lock, git push
+core/HOARD_markdown.m31  the README's Markdown, a safe subset, to HTML
+core/HOARD_highlight.m31 syntax highlighting for file pages and code blocks
 core/HOARD_html.m31      escaping and the page layout
 tests/                   unit tests (t_*.m31) and the end-to-end suite
 scripts/                 build.sh, test.sh, release helpers
@@ -162,6 +165,43 @@ sniffed from the first 8000 bytes. Everything comes from `git` subprocesses
 Every piece of repository text is HTML-escaped on its way into a page. Pages
 are written as regular files, and stale ones are removed.
 
+The summary ends with the default branch's README: the first of `README.md`,
+`README.markdown`, `README`, `README.txt`, `README.rst` at the top of the
+tree, in any case, within the 512 KiB blob limit and not binary. A Markdown
+one is rendered by `HOARD_markdown`; any other is shown escaped in a `<pre>`.
+The Markdown subset is headings, paragraphs, emphasis, inline code, fenced and
+indented code, nested lists, block quotes, rules, simple tables, links and
+autolinks; reference links and the rest stay text. It is safe by
+construction rather than by filtering:
+
+- Every byte of the source goes through the escaper; the only tags on the
+  page are the fixed ones the renderer writes. Raw HTML is shown, not run.
+- A link keeps an href only for `http:`, `https:`, `mailto:` (scheme compared
+  case-insensitively) or a `#fragment`, or for a relative path (decoded,
+  `.`/`..` resolved, never above the root) that names a file or directory of
+  the tree, which becomes that file's page or `files.html`. Anything else --
+  another scheme, a control character or space anywhere in the destination,
+  `//host` -- leaves the link text as plain text. Entities are never decoded,
+  so `&#106;avascript:` is a (missing) relative path.
+- Images are links to their source, never `<img>` (the CSP allows images
+  only from the pages' own origin).
+- It is linear: link brackets are matched in one stack pass, a backtick run
+  with no closer is remembered so it is never searched for twice, emphasis is
+  paired with one stack per marker, and block quotes and lists nest at most
+  16 deep, past which the rest is text.
+
+File pages and README code fences are highlighted by `HOARD_highlight`: one
+forward pass of a table-driven tokenizer (comments, strings, numbers,
+keywords, types) for m31, Rust, Lua, shell, Python, JavaScript/TypeScript,
+C/C++, Go, JSON, YAML, TOML and Dockerfiles, chosen by extension or file
+name (by the fence's info string in a README). Unknown languages and files
+over 256 KiB are only escaped. An unterminated string ends at its line (or
+the end of the file, for kinds that span lines), an unterminated comment at
+the end of the file, and every byte is still escaped. Tokens get the classes
+`hk hs hc hn ht`, coloured by the inline stylesheet, with a darker variant
+under `prefers-color-scheme: dark`. The CSP is unchanged: no script, no
+external style.
+
 Two pushes close together each re-render until the branch tip they rendered
 is still the tip afterwards, so the last one to finish shows the newest commit.
 
@@ -204,7 +244,7 @@ subprocesses.
   A `HEAD` gets the headers without running `git archive`.
 - `archive/` is routed before the pages and the generator never writes
   there, so no generated page can shadow a tarball or the reverse.
-### 3.5 Push mirrors
+### 3.6 Push mirrors
 A repository may name a mirror: `-mirror REPO URL [--token-env NAME] [--user
 NAME]` sets it, `-mirror REPO --off` removes it, `-mirror REPO` shows it and
 `-mirror-now REPO` pushes at once and reports. The main use is GitHub, as an
@@ -256,7 +296,7 @@ post-receive hook
 - Setting a mirror rewrites `hooks/post-receive`, so an install whose hook
   predates mirrors picks up the new line.
 
-### 3.6 Security rules carried over unchanged
+### 3.7 Security rules carried over unchanged
 
 - Path checks run after percent-decoding; `..`, `.`, NUL and backslash are
   refused before any lookup.
@@ -267,7 +307,7 @@ post-receive hook
 - Passwords come from stdin, never argv. A password with a line break or NUL,
   an empty one, or one over 1024 bytes is refused.
 
-### 3.6 Access tokens
+### 3.8 Access tokens
 
 - `-token USER NAME [--read-only]` makes `hoard_` plus 64 hex digits: 32
   octets from `random.system()`, which is getrandom(2) (getentropy(3) off
@@ -298,7 +338,7 @@ post-receive hook
   nosniff` and `Referrer-Policy: same-origin`. Private repositories add
   `Cache-Control: private, no-store`.
 
-### 3.6 Deleting and renaming a repository
+### 3.9 Deleting and renaming a repository
 
 orogit has neither. hoard never destroys a repository: deleting one is the
 admin's decision, and undoing a mistake must not need a backup.
@@ -354,6 +394,12 @@ URL.
   mirrors (to a `file://` repository, and to a second hoard over HTTP with
   the token from the environment, checked absent from config, hook and logs;
   a hanging or missing mirror never failing the push; `--off`).
+- `tests/t_markdown.m31`: the Markdown subset, XSS vectors (script and
+  `onerror` HTML, `javascript:` in any case, split by a newline or a tab,
+  entity-encoded, `data:`, `vbscript:`, attribute breakouts), unclosed
+  constructs, nesting 100 000 deep, lines of hundreds of KiB, and the
+  highlighter (comment markers inside strings, unterminated strings and
+  comments, escapes).
 - Everything runs through `tests/test.sh`, on Linux and macOS, in CI.
 
 ## 5. Release and install
