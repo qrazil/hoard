@@ -18,6 +18,7 @@ The same feature set as orogit, nothing more in 0.1:
 | Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary, log, files, one page per file and per commit. |
 | Index | `/` lists the repositories the requester may read; `/?login` asks for credentials. |
 | Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`. |
+| Mirrors | Per repository, optional: after every push the branches and tags are pushed on to another remote (GitHub, say), in the background. `-mirror`, `-mirror-now`. See 3.5. |
 
 URL layout (unchanged from orogit):
 
@@ -38,9 +39,14 @@ copying `orogit.json` to `hoard.json`. The `oro` key is ignored.
   "base_url": "https://git.example.org",
   "trusted_proxies": ["127.0.0.1"],
   "users": {"alice": {"hash": "$6$salt$..."}},
-  "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}}
+  "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"],
+                      "mirror": {"url": "https://github.com/owner/hello.git",
+                                 "token_env": "HOARD_GITHUB_TOKEN"}}}
 }
 ```
+
+`mirror` is hoard's own addition (orogit has no mirrors) and optional, so an
+orogit config loads unchanged.
 
 ## 2. What changes from orogit, and why
 
@@ -49,7 +55,7 @@ copying `orogit.json` to `hoard.json`. The `oro` key is ignored.
 | `openssl passwd -6` in a subprocess, with a 5-minute login cache because the call blocked the VM | SHA-512-crypt computed in-process (`HOARD_crypt`, about 30 ms per verify). The cache is kept only to save CPU. | No subprocess, no password on any pipe. Checked against the spec vectors and `openssl passwd -6`. `HOARD_crypt` carries its own SHA-512 on plain 64-bit ints: `lib/crypto/sha512` allocates per word and made a verify take about 650 ms. |
 | Green threads; `http.serve` with a connection cap | An accept loop plus a fixed pool of worker threads; each accepted `net.Conn` is moved to a worker over a channel. | m31's `http.serve` handles one connection at a time and cannot share a handler between threads (non-atomic refcounts). Moving the connection is the documented pattern (reference §8.3). |
 | `static_files`, which follows symlinks | hoard serves pages itself: it refuses any path component that is a symlink, then checks `fs.realpath` stays inside the pages root. | m31 has `fs.is_link` and `fs.realpath`. Closes orogit's documented race. The rule that pages are written as regular files, never checked out, stays. |
-| Post-receive hook is an Oro script reached through `core.hooksPath` (Oro has no chmod) | `-init` writes `hooks/post-receive`, a two-line shell script created with mode 0755 (`io.open(perm:)`), which runs `hoard -regen --hook <repo>`. | m31 can set a mode when it creates a file. |
+| Post-receive hook is an Oro script reached through `core.hooksPath` (Oro has no chmod) | `-init` writes `hooks/post-receive`, a two-line shell script created with mode 0755 (`io.open(perm:)`), which runs `hoard -regen --hook <repo>` and then starts the mirror push (3.5). | m31 can set a mode when it creates a file. |
 | No lock: two admin commands at once can lose an update | Admin commands take a lock by creating `<config>.lock` with `fs.mkdir`, which is atomic. A lock left by a crash is reported with the path to remove. | A real fix for an open orogit gap without needing `flock`. |
 | Emptied page directories left behind (no rmdir) | Stale page directories are removed with `fs.rmdir`. | m31 has rmdir. |
 | One process, one interpreter | One static binary per platform, released with `SHA256SUMS` and a curl installer. | Repo standard. |
@@ -65,6 +71,7 @@ core/HOARD_auth.m31      Basic credentials, the guard thread (cache and damping)
 core/HOARD_server.m31    accept loop, worker pool, request loop, routing, index, pages
 core/HOARD_cgi.m31       git http-backend as streamed CGI
 core/HOARD_pages.m31     the page generator
+core/HOARD_mirror.m31    push mirrors: credential helper, lock, git push
 core/HOARD_html.m31      escaping and the page layout
 tests/                   unit tests (t_*.m31) and the end-to-end suite
 scripts/                 build.sh, test.sh, release helpers
@@ -150,7 +157,62 @@ is still the tip afterwards, so the last one to finish shows the newest commit.
 Later (not 0.1): read objects through the m31git library instead of `git`
 subprocesses.
 
-### 3.5 Security rules carried over unchanged
+### 3.5 Push mirrors
+
+A repository may name a mirror: `-mirror REPO URL [--token-env NAME] [--user
+NAME]` sets it, `-mirror REPO --off` removes it, `-mirror REPO` shows it and
+`-mirror-now REPO` pushes at once and reports. The main use is GitHub, as an
+off-site backup and a public copy.
+
+```
+post-receive hook
+  -regen --hook REPO                       pages, as before
+  -mirror-now --hook REPO  &               background, stdin /dev/null,
+                                           output appended to mirror.log
+    lock <repo>.git/hoard-mirror.lock      mkdir; wait for an earlier push
+    git push --prune URL +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*
+                                           10-minute timeout
+```
+
+- **Never in the way of a push.** The mirror push runs detached from the
+  hook with every stream redirected, so receive-pack neither waits for it
+  nor shows its output, and the hook still exits 0. Each outcome is one
+  line with the time in `mirror.log` beside the config, failures with git's
+  reason.
+- **The token.** The config holds only the name of an environment variable
+  of the server. A URL with a user name or password in it is refused, so a
+  token cannot be written into the config by accident. The token reaches
+  git through a credential helper given with `-c`, a shell function that
+  prints `$HOARD_MIRROR_TOKEN` with the `printf` builtin; the variable is
+  set in git's environment. No process ever has the token in its argv, which
+  `ps` shows to every user; an environment is readable only by the same user
+  and root. The helper list is emptied first, so a helper from the user's
+  git config never sees or stores it. GIT_ASKPASS pointing back at hoard
+  would have done the same with a hidden command and an exec per prompt.
+  Output that is logged has the token cut out in case a remote echoes it.
+- **How the token gets to the hook.** The hook runs under `git
+  http-backend`, whose CGI environment is deliberately bare. For a
+  `git-receive-pack` request to a repository whose mirror names a token
+  variable, that one variable is copied into the backend's environment; no
+  other request gets it. Names starting with `GIT_` are refused.
+- **User name.** `x-access-token` unless the mirror sets `"user"`: GitHub
+  accepts any name with a personal access token and wants that one with an
+  app installation token.
+- **Not `--mirror`.** That pushes and prunes every ref, and GitHub keeps
+  `refs/pull/*`, which it refuses to delete, so every push would end in
+  errors. Branches and tags are pushed forced, and `--prune` deletes there
+  what was deleted here, in those two namespaces only.
+- **Ordering.** Two pushes close together start two mirror pushes. They take
+  the repository's lock one after the other, and each pushes the refs as
+  they are when it gets the lock, so the last one sends the newest refs and
+  an older push can never rewind the mirror. A lock held longer than any
+  push can take is reported with the path to remove.
+- **Schemes.** https, http and file. Not ssh: the hook runs without `$HOME`,
+  so it would find no keys.
+- Setting a mirror rewrites `hooks/post-receive`, so an install whose hook
+  predates mirrors picks up the new line.
+
+### 3.6 Security rules carried over unchanged
 
 - Path checks run after percent-decoding; `..`, `.`, NUL and backslash are
   refused before any lookup.
@@ -176,7 +238,10 @@ subprocesses.
   client against a server on a free port with a temp config: public versus
   private, refused pushes, a 100 MB push with RSS measured, concurrent clones
   during it, page regeneration, HTML injection, path attacks, damping, the
-  proxy-chain client address, atomic config save, and the admin lock.
+  proxy-chain client address, atomic config save, the admin lock, and push
+  mirrors (to a `file://` repository, and to a second hoard over HTTP with
+  the token from the environment, checked absent from config, hook and logs;
+  a hanging or missing mirror never failing the push; `--off`).
 - Everything runs through `tests/test.sh`, on Linux and macOS, in CI.
 
 ## 5. Release and install

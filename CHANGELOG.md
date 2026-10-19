@@ -22,3 +22,9 @@ First version: the m31 port of orogit.
 - `TCP_NODELAY` on every connection: no 40 ms Nagle stall per kept-alive
   request.
 - SHA-512 comes from m31 0.7.0's `lib/crypto/sha512`.
+- Push mirrors: `-mirror REPO URL [--token-env NAME] [--user NAME]` (or
+  `--off`) per repository; after every push its branches and tags are pushed
+  on in the background (`--prune`, not `--mirror`), logged to `mirror.log`,
+  never failing the push. The token comes from the server's environment
+  through a credential helper, never the config, argv or logs.
+  `-mirror-now REPO` pushes at once.

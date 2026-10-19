@@ -40,11 +40,28 @@ hoard --config data/hoard.json -serve --workers 16
 | `-visibility REPO public\|private` | anonymous read access |
 | `-proxies [--set ENTRY...]` | show or replace the trusted proxies (IPs, IPv4 CIDR blocks) |
 | `-regen NAME` | rebuild a repository's pages |
+| `-mirror REPO [URL [--token-env NAME] [--user NAME] \| --off]` | show, set or remove a push mirror |
+| `-mirror-now REPO` | push a repository to its mirror now and report |
 | `-list` | users and repositories |
 
 The config file defaults to `$HOARD_CONFIG`, then `./hoard.json`. Several
 commands may share one line; the whole line is checked before any of it runs.
 Usage errors exit 64, other failures 1.
+
+Push mirrors: after every push, a repository with a mirror is pushed on to
+it in the background (branches and tags, forced, deletions included); the
+outcome goes to `mirror.log` beside the config, and a failing mirror never
+fails the push. The token is never stored: name the server's environment
+variable that holds it.
+
+```
+hoard -mirror site https://github.com/owner/site.git --token-env HOARD_GITHUB_TOKEN
+HOARD_GITHUB_TOKEN=... hoard -serve        # the server needs the variable
+```
+
+The user name sent with the token is `x-access-token` (GitHub) unless
+`--user` says otherwise. URLs are https, http or file; one with a password
+in it is refused.
 
 Moving from orogit: copy `orogit.json` to `hoard.json` and the `repos/`
 directory beside it, run `-init` in a fresh directory to get the hook, then
@@ -80,6 +97,7 @@ core/HOARD_auth.m31    Basic credentials; the guard thread (cache, damping)
 core/HOARD_server.m31  accept loop, workers, routing, index, page serving
 core/HOARD_cgi.m31     git http-backend, streamed
 core/HOARD_pages.m31   the page generator
+core/HOARD_mirror.m31  push mirrors
 core/HOARD_html.m31    escaping and page layout
 tests/                 test.sh runs everything
 docs/design.md         how it works and why

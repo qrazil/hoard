@@ -300,6 +300,9 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
     }
     if (is_git) {
         HOARD_cgi.Call call = HOARD_cgi.Call(repo, rest, HOARD_store.repo_root(config, view.config_path), user, address, path_env);
+        if (need == HOARD_cgi.WRITE) {
+            call.token_env = HOARD_store.mirror_token_env(config, repo);
+        }
         return HOARD_cgi.run(connection, incoming, call);
     }
     bool is_public = false;

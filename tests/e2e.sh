@@ -35,11 +35,13 @@ done
 T=$(mktemp -d "${TMPDIR:-/tmp}/hoard-e2e.XXXXXX")
 T=$(cd "$T" && pwd -P)
 SPID=""
+SPID2=""
+SINKPID=""
 cleanup() {
-    if [ -n "$SPID" ]; then
-        kill "$SPID" 2>/dev/null
-        wait "$SPID" 2>/dev/null
-    fi
+    for pid in $SPID $SPID2 $SINKPID; do
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+    done
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -352,6 +354,30 @@ def half(argv):
 
 def mono(argv):
     print("%.3f" % time.time())
+
+
+# repo_set FILE REPO KEY JSON: set one key of a repository entry by hand.
+def repo_set(argv):
+    import json
+    path, repo, key, value = argv
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["repos"][repo][key] = json.loads(value)
+    with open(path, "w") as f:
+        f.write(json.dumps(cfg, indent=2) + "\n")
+
+
+# sink: listen on a free port, print it, then accept connections and never
+# answer them -- a mirror remote that hangs.
+def sink(argv):
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(16)
+    print(s.getsockname()[1], flush=True)
+    held = []
+    while True:
+        c, _ = s.accept()
+        held.append(c)
 
 
 cmd = sys.argv[1]
@@ -1110,6 +1136,223 @@ check "the same command twice is a list, not a set" $? "rc $RC: $(err1)"
 check "no admin lock is left behind at the end" $?
 kill -0 "$SPID" 2>/dev/null
 check "the server is still running at the end" $?
+
+# --- 14: push mirrors -----------------------------------------------------------------
+
+section "14. push mirrors"
+# The server is restarted with a mirror token in its environment, as an
+# admin would start it; the token never goes anywhere else.
+MTOKEN="e2e-mirror-token-$$-$RANDOM"
+kill "$SPID" 2>/dev/null
+wait "$SPID" 2>/dev/null
+PORT=$(py free_port)
+BASE="127.0.0.1:$PORT"
+env -i PATH="$PATH" HOME="$T/home" GIT_CONFIG_NOSYSTEM=1 HOARD_E2E_MIRROR_TOKEN="$MTOKEN" \
+    "$HOARD_BIN" --config "$CFG" -serve --listen "$BASE" --workers 4 \
+    >"$T/server.out" 2>"$T/server.err" </dev/null &
+SPID=$!
+for _ in $(seq 1 100); do
+    grep -q "listening" "$T/server.err" 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "listening" "$T/server.err"
+check "the server restarts with a mirror token in its environment" $?
+MLOG="$SRV/mirror.log"
+# until SECONDS CMD...: run CMD every 0.2 s until it succeeds or SECONDS pass.
+until_ok() {
+    local limit=$1 tries
+    shift
+    tries=$((limit * 5))
+    while [ "$tries" -gt 0 ]; do
+        "$@" && return 0
+        sleep 0.2
+        tries=$((tries - 1))
+    done
+    "$@"
+}
+ref_is() { [ "$(git --git-dir "$1" rev-parse -q --verify "$2" 2>/dev/null)" = "$3" ]; }
+log_has() { grep -F -q -- "$1" "$MLOG" 2>/dev/null; }
+
+hc -addrepo mir -grant mir alice write
+check "addrepo mir" $RC "$(err1)"
+MIR1="$T/mirror1.git"
+git init -q --bare "$MIR1"
+hc -mirror mir "file://$MIR1"
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.mir.mirror)" = "{\"url\": \"file://$MIR1\"}" ]
+check "-mirror sets the repository's mirror in the config" $? "rc $RC: $(err1) $(py config_get "$CFG" repos.mir.mirror)"
+hc -mirror mir
+[ "$RC" = 0 ] && grep -q "mir mirrors to file://$MIR1" "$T/cli.out" && grep -q "no token" "$T/cli.out"
+check "-mirror REPO shows it" $? "rc $RC: $(cat "$T/cli.out")"
+hc -list
+grep -q "mir (private) readers= writers=alice mirror=file://$MIR1" "$T/cli.out"
+check "-list shows the mirror" $? "$(grep mir "$T/cli.out")"
+grep -F -q -- "-mirror-now --hook \"\$repo\" </dev/null >>'$MLOG' 2>&1 &" "$HOOK"
+check "the hook starts -mirror-now in the background, logging to mirror.log" $? "$(cat "$HOOK")"
+
+MW="$WORK/mw"
+git init -q -b main "$MW"
+M1=$(commit_file "$MW" a.txt "one
+" "mirror one")
+git -C "$MW" tag v1
+git -C "$MW" branch topic
+g -C "$MW" push "$(aurl "$ALICE" /mir.git)" main topic v1
+check "alice pushes main, a branch and a tag to mir" $? "$(glast)"
+until_ok 20 ref_is "$MIR1" refs/heads/main "$M1"
+check "the push reaches the file:// mirror" $? "$(cat "$MLOG" 2>&1 | tail -n 3)"
+until_ok 5 ref_is "$MIR1" refs/heads/topic "$M1" && ref_is "$MIR1" refs/tags/v1 "$M1"
+check "...with its other branches and its tags" $?
+until_ok 5 log_has "mirror mir -> file://$MIR1: pushed"
+check "mirror.log records the push" $? "$(tail -n 3 "$MLOG" 2>&1)"
+git --git-dir "$MIR1" update-ref refs/pull/1/head "$M1"
+g -C "$MW" push "$(aurl "$ALICE" /mir.git)" :topic
+check "alice deletes the branch" $? "$(glast)"
+until_ok 20 sh -c "! git --git-dir '$MIR1' rev-parse -q --verify refs/heads/topic >/dev/null"
+check "a deleted branch is pruned from the mirror" $?
+ref_is "$MIR1" refs/pull/1/head "$M1"
+check "...but a ref outside heads and tags is left alone (not --mirror)" $?
+hc -mirror-now mir
+[ "$RC" = 0 ] && grep -q "mirror mir -> file://$MIR1: pushed" "$T/cli.out"
+check "-mirror-now pushes at once and reports" $? "rc $RC: $(err1)"
+
+hc -mirror mir "https://user:secret@github.com/o/mir.git"
+[ "$RC" = 1 ] && grep -q "user name or password" "$T/cli.err"
+check "a mirror URL with a password in it is refused" $? "rc $RC: $(err1)"
+hc -mirror mir "ssh://git@github.com/o/mir.git"
+[ "$RC" = 1 ] && grep -q "https://, http:// or file://" "$T/cli.err"
+check "an ssh mirror URL is refused" $? "rc $RC: $(err1)"
+hc -mirror mir "https://github.com/o/mir.git" --token-env GIT_DIR
+[ "$RC" = 1 ] && grep -q "not an environment variable name" "$T/cli.err"
+check "a GIT_* token variable is refused" $? "rc $RC: $(err1)"
+hc -mirror mir "https://github.com/o/mir.git" --token-env "MY-TOKEN"
+[ "$RC" = 1 ]
+check "an invalid token variable name is refused" $? "rc $RC: $(err1)"
+hc -mirror mir --off "file://$MIR1"
+[ "$RC" = 1 ]
+check "--off with a URL is refused" $? "rc $RC: $(err1)"
+[ "$(py config_get "$CFG" repos.mir.mirror)" = "{\"url\": \"file://$MIR1\"}" ]
+check "...and the refusals left the mirror alone" $?
+
+# Round trip: other admin commands load and save the config and keep the
+# mirror; a hand-written mirror with an unknown key loads; a bad one is an
+# error, not a silently dropped backup.
+hc -grant mir bob read
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.mir.mirror.url)" = "\"file://$MIR1\"" ]
+check "the mirror survives another command's save" $? "rc $RC: $(err1)"
+cp "$CFG" "$T/cfg.keep"
+py repo_set "$CFG" mir mirror "{\"url\": \"file://$MIR1\", \"token_env\": \"SOME_TOKEN\", \"user\": \"bot\", \"later\": 1}"
+hc -mirror mir
+[ "$RC" = 0 ] && grep -q "token from \$SOME_TOKEN, user bot" "$T/cli.out"
+check "a hand-written mirror with token_env, user and an unknown key loads" $? "rc $RC: $(err1)"
+hc -grant mir bob read
+[ "$(py config_get "$CFG" repos.mir.mirror)" = "{\"token_env\": \"SOME_TOKEN\", \"url\": \"file://$MIR1\", \"user\": \"bot\"}" ]
+check "...and is written back with token_env and user" $? "$(py config_get "$CFG" repos.mir.mirror)"
+py repo_set "$CFG" mir mirror "{\"url\": \"https://a:b@example.org/x.git\"}"
+hc -list
+[ "$RC" = 1 ] && grep -q "repository 'mir': the mirror URL holds a user name or password" "$T/cli.err"
+check "a hand-written mirror with a password in its URL is a config error" $? "rc $RC: $(err1)"
+cp "$T/cfg.keep" "$CFG"
+
+section "14b. a mirror on another hoard, with the token from the environment"
+SRV2="$T/srv2"
+CFG2="$SRV2/hoard.json"
+mkdir -p "$SRV2"
+"$HOARD_BIN" --config "$CFG2" -init >/dev/null 2>&1
+printf '%s\n' "$MTOKEN" | "$HOARD_BIN" --config "$CFG2" -adduser mirrorbot >/dev/null 2>&1
+"$HOARD_BIN" --config "$CFG2" -addrepo copy -grant copy mirrorbot write >/dev/null 2>&1
+check "a second hoard with a private repository and a mirror user" $?
+PORT2=$(py free_port)
+BASE2="127.0.0.1:$PORT2"
+env -i PATH="$PATH" HOME="$T/home" GIT_CONFIG_NOSYSTEM=1 \
+    "$HOARD_BIN" --config "$CFG2" -serve --listen "$BASE2" --workers 2 \
+    >"$T/server2.out" 2>"$T/server2.err" </dev/null &
+SPID2=$!
+for _ in $(seq 1 100); do
+    grep -q "listening" "$T/server2.err" 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "listening" "$T/server2.err"
+check "the second hoard serves" $?
+hc -addrepo mir2 -grant mir2 alice write -mirror mir2 "http://$BASE2/copy.git" --token-env HOARD_E2E_MIRROR_TOKEN --user mirrorbot
+check "mir2 mirrors to the second hoard with --token-env and --user" $RC "$(err1)"
+M2=$(commit_file "$MW" b.txt "two
+" "mirror two")
+g -C "$MW" push "$(aurl "$ALICE" /mir2.git)" main
+check "alice pushes to mir2" $? "$(glast)"
+COPY="$SRV2/repos/copy.git"
+until_ok 20 ref_is "$COPY" refs/heads/main "$M2"
+check "the push reaches the other hoard through Basic auth with the token" $? "$(tail -n 3 "$MLOG" 2>&1)"
+leaked=""
+for file in "$CFG" "$HOOK" "$MLOG" "$T/server.out" "$T/server.err" "$CFG2" "$T/server2.out" "$T/server2.err"; do
+    grep -F -q -- "$MTOKEN" "$file" 2>/dev/null && leaked="$leaked $file"
+done
+[ -z "$leaked" ]
+check "the token is in no config, hook script or log" $? "found in:$leaked"
+hc -mirror-now mir2
+[ "$RC" = 1 ] && grep -q "HOARD_E2E_MIRROR_TOKEN is not set or empty" "$T/cli.err"
+check "-mirror-now without the token variable fails and names it" $? "rc $RC: $(err1)"
+HOARD_E2E_MIRROR_TOKEN="wrong-$MTOKEN" "$HOARD_BIN" --config "$CFG" -mirror-now mir2 </dev/null >"$T/cli.out" 2>"$T/cli.err"
+RC=$?
+[ "$RC" = 1 ] && grep -q "git push failed" "$T/cli.err" && ! grep -F -q -- "$MTOKEN" "$T/cli.err"
+check "a wrong token fails with git's reason and without the token" $? "rc $RC: $(err1)"
+HOARD_E2E_MIRROR_TOKEN="$MTOKEN" "$HOARD_BIN" --config "$CFG" -mirror-now mir2 </dev/null >"$T/cli.out" 2>"$T/cli.err"
+RC=$?
+[ "$RC" = 0 ] && grep -q "pushed" "$T/cli.out" && ! grep -F -q -- "$MTOKEN" "$T/cli.out"
+check "-mirror-now with the token pushes" $? "rc $RC: $(err1)"
+
+section "14c. a failing mirror never fails the push"
+python3 -I "$T/helper.py" sink >"$T/sink.port" 2>/dev/null &
+SINKPID=$!
+until_ok 5 test -s "$T/sink.port"
+SINK_PORT=$(cat "$T/sink.port")
+hc -mirror mir "http://127.0.0.1:$SINK_PORT/hangs.git"
+check "mir now mirrors to a remote that never answers" $RC "$(err1)"
+M3=$(commit_file "$MW" c.txt "three
+" "mirror three")
+t0=$SECONDS
+g -C "$MW" push "$(aurl "$ALICE" /mir.git)" main
+prc=$?
+[ "$prc" = 0 ] && [ $((SECONDS - t0)) -lt 10 ] && ref_is "$(bare mir)" refs/heads/main "$M3"
+check "the push succeeds at once while its mirror hangs" $? "rc $prc in $((SECONDS - t0)) s: $(glast)"
+# The remote goes away; the hanging mirror push fails and logs why.
+kill "$SINKPID" 2>/dev/null
+wait "$SINKPID" 2>/dev/null
+SINKPID=""
+until_ok 20 log_has "mirror mir -> http://127.0.0.1:$SINK_PORT/hangs.git: git push failed"
+check "the failure is logged with git's reason" $? "$(tail -n 3 "$MLOG" 2>&1)"
+hc -mirror mir "file://$T/missing.git"
+M4=$(commit_file "$MW" d.txt "four
+" "mirror four")
+g -C "$MW" push "$(aurl "$ALICE" /mir.git)" main
+[ "$?" = 0 ] && ref_is "$(bare mir)" refs/heads/main "$M4"
+check "a push to a repository whose mirror is missing succeeds" $? "$(glast)"
+until_ok 20 log_has "mirror mir -> file://$T/missing.git: git push failed"
+check "...and the failure is logged" $? "$(tail -n 3 "$MLOG" 2>&1)"
+
+section "14d. --off stops mirroring"
+hc -mirror mir "file://$MIR1"
+hc -mirror-now mir
+ref_is "$MIR1" refs/heads/main "$M4"
+check "the file:// mirror catches up" $? "$(err1)"
+hc -mirror mir --off
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.mir.mirror)" = null ]
+check "-mirror --off removes the mirror from the config" $? "rc $RC: $(err1)"
+hc -mirror mir
+grep -q "mir has no mirror" "$T/cli.out"
+check "-mirror REPO then says there is none" $? "$(cat "$T/cli.out")"
+lines=$(wc -l <"$MLOG")
+M5=$(commit_file "$MW" e.txt "five
+" "mirror five")
+g -C "$MW" push "$(aurl "$ALICE" /mir.git)" main
+sleep 2
+ref_is "$MIR1" refs/heads/main "$M4" && [ "$(wc -l <"$MLOG")" = "$lines" ]
+check "a push after --off is not mirrored, and nothing is logged" $?
+hc -mirror-now mir
+[ "$RC" = 1 ] && grep -q "has no mirror" "$T/cli.err"
+check "-mirror-now without a mirror is an error" $? "rc $RC: $(err1)"
+[ ! -e "$(bare mir)/hoard-mirror.lock" ] && [ ! -e "$(bare mir2)/hoard-mirror.lock" ] && [ ! -e "$CFG.lock" ]
+check "no mirror or admin lock is left behind" $?
+kill -0 "$SPID" 2>/dev/null && kill -0 "$SPID2" 2>/dev/null
+check "both servers are still running" $?
 
 section "done"
 if [ "$FAILED" -gt 0 ]; then

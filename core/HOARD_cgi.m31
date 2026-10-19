@@ -229,6 +229,9 @@ pub type Call {
     pub str user;
     pub str address;
     pub str path_env;
+    // The environment variable holding the repository's mirror token
+    // (HOARD_mirror), or "".
+    pub str token_env = "";
 }
 
 void log_line(str text) {
@@ -306,6 +309,20 @@ pub Next run(net.Conn connection, http.RequestStream incoming, Call call) {
     if (call.user != "") {
         // Also what makes the backend allow receive-pack at all.
         env.set("REMOTE_USER", call.user);
+    }
+    // The post-receive hook pushes to the repository's mirror and needs its
+    // token, which only this process's environment holds. The one variable
+    // the mirror names is passed on, and only to a push: it reaches
+    // receive-pack and the hook through their environments, which only this
+    // user can read, never through an argv.
+    if (call.rest == "/git-receive-pack" && call.token_env != "" && !env.contains(call.token_env)) {
+        match (os.env(call.token_env)) {
+            case Some(str token): {
+                env.set(call.token_env, token);
+            }
+            case None: {
+            }
+        }
     }
     List<str> argv = ["git", "http-backend"];
     match (proc.start(argv, cwd: call.repo_root, env: Option<Map<str, str>>.Some(env))) {

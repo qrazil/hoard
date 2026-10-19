@@ -20,9 +20,11 @@ import args;
 import core.HOARD_addr;
 import core.HOARD_crypt;
 import core.HOARD_gc;
+import core.HOARD_mirror;
 import core.HOARD_pages;
 import core.HOARD_server;
 import core.HOARD_store;
+import date;
 import fs;
 import io;
 import os;
@@ -66,6 +68,15 @@ proxies.values("set", placeholder: "ENTRY", help: "replace the list with these I
 args.Parser regen = table.command("regen", "rebuild a repository's pages");
 regen.flag("hook", help: "called from post-receive: keep the pages that are already built");
 regen.positional("name", help: "the repository name");
+args.Parser mirror = table.command("mirror", "show, set or remove a repository's push mirror");
+mirror.positional("repo", help: "the repository");
+mirror.optional("url", "", help: "push every branch and tag here after each push (https://, http:// or file://)");
+mirror.value("token-env", placeholder: "NAME", help: "the environment variable of the server that holds the token; never the token itself");
+mirror.value("user", placeholder: "NAME", help: "the user name sent with the token (default x-access-token)");
+mirror.flag("off", help: "stop mirroring this repository");
+args.Parser mirroring = table.command("mirror-now", "push a repository to its mirror now and report");
+mirroring.flag("hook", help: "called from post-receive: log the outcome, and say nothing without a mirror");
+mirroring.positional("name", help: "the repository name");
 table.command("gc", "pack repositories with loose objects now (serve does this every gc_hours)");
 table.command("list", "show users and repositories", short: "l");
 table.completions();
@@ -105,6 +116,12 @@ Result<void, str> dispatch(str path, args.Parsed command) {
     }
     if (word == "list") {
         return cmd_list(path);
+    }
+    if (word == "mirror-now") {
+        return cmd_mirror_now(path, command);
+    }
+    if (word == "mirror" && command.optional("url") == "" && !command.is_flag_set("off")) {
+        return show_mirror(path, command);
     }
     if (word == "proxies" && !command.is_given("set")) {
         HOARD_store.Config config = HOARD_store.load(path)?;
@@ -217,6 +234,9 @@ Result<void, str> change(str path, args.Parsed command) {
         print(entries.size().to_str() + " trusted proxy entries");
         return Result<void, str>.Ok;
     }
+    if (word == "mirror") {
+        return set_mirror(path, config, command);
+    }
     return Result<void, str>.Err("'-" + word + "' is a declared command with no implementation");
 }
 
@@ -316,8 +336,10 @@ Result<str, str> self_path() {
 }
 
 /// Write `hooks/post-receive` beside the config: a shell script, mode 0755,
-/// that runs this binary to rebuild the pushed repository's pages. A push must
-/// not fail because its pages did not rebuild, so it always exits 0.
+/// that runs this binary to rebuild the pushed repository's pages and then,
+/// in the background, to push it to its mirror (HOARD_mirror). A push must
+/// not fail because its pages did not rebuild or its mirror did not take it,
+/// so it always exits 0.
 Result<void, str> write_hook(str path) {
     str program = self_path()?;
     if (program.contains("'") || path.contains("'")) {
@@ -326,7 +348,10 @@ Result<void, str> write_hook(str path) {
     str directory = hooks_directory(path);
     HOARD_store.make_dirs(directory)?;
     str hook = fs.join(directory, "post-receive");
-    str script = "#!/bin/sh\n# Written by hoard -init: rebuild the pushed repository's pages.\ncat >/dev/null\nrepo=$(git config --get hoard.repo) || { echo 'hoard: no hoard.repo setting; pages not rebuilt'; exit 0; }\n'" + program + "' --config '" + path + "' -regen --hook \"$repo\" || echo 'hoard: page generation failed'\nexit 0\n";
+    // The mirror push runs in the background with every stream redirected,
+    // so receive-pack does not wait for it and the pusher never sees it.
+    str log = fs.join(HOARD_store.parent_directory(path), "mirror.log");
+    str script = "#!/bin/sh\n# Written by hoard: rebuild the pushed repository's pages, then push it to its mirror.\ncat >/dev/null\nrepo=$(git config --get hoard.repo) || { echo 'hoard: no hoard.repo setting; pages not rebuilt'; exit 0; }\n'" + program + "' --config '" + path + "' -regen --hook \"$repo\" || echo 'hoard: page generation failed'\n'" + program + "' --config '" + path + "' -mirror-now --hook \"$repo\" </dev/null >>'" + log + "' 2>&1 &\nexit 0\n";
     if (fs.is_present(hook)) {
         match (fs.remove(hook)) {
             case Ok(_): {
@@ -437,7 +462,93 @@ Result<void, str> cmd_list(str path) {
         if (entry.is_public) {
             shown = "public";
         }
-        print("  " + name + " (" + shown + ") readers=" + entry.readers.join(",") + " writers=" + entry.writers.join(","));
+        str mirrored = "";
+        if (entry.mirror_url != "") {
+            mirrored = " mirror=" + entry.mirror_url;
+        }
+        print("  " + name + " (" + shown + ") readers=" + entry.readers.join(",") + " writers=" + entry.writers.join(",") + mirrored);
+    }
+    return Result<void, str>.Ok;
+}
+
+// --- mirrors -----------------------------------------------------------------
+
+Result<void, str> show_mirror(str path, args.Parsed command) {
+    str name = command.positional("repo");
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    HOARD_store.Repo entry = repo_of(config, name)?;
+    if (command.is_given("token-env") || command.is_given("user")) {
+        return Result<void, str>.Err("--token-env and --user go with a mirror URL");
+    }
+    if (entry.mirror_url == "") {
+        print(name + " has no mirror");
+        return Result<void, str>.Ok;
+    }
+    print(name + " mirrors to " + entry.mirror_url);
+    if (entry.mirror_token_env == "") {
+        print("no token");
+    } else {
+        print("token from $" + entry.mirror_token_env + ", user " + HOARD_mirror.user_of(entry));
+    }
+    return Result<void, str>.Ok;
+}
+
+Result<void, str> set_mirror(str path, HOARD_store.Config config, args.Parsed command) {
+    str name = command.positional("repo");
+    str url = command.optional("url");
+    HOARD_store.Repo entry = repo_of(config, name)?;
+    if (command.is_flag_set("off")) {
+        if (url != "" || command.is_given("token-env") || command.is_given("user")) {
+            return Result<void, str>.Err("--off takes no URL, --token-env or --user");
+        }
+        entry.mirror_url = "";
+        entry.mirror_token_env = "";
+        entry.mirror_user = "";
+        HOARD_store.save(path, config)?;
+        print(name + " is no longer mirrored");
+        return Result<void, str>.Ok;
+    }
+    str token_env = command.value("token-env").or("");
+    str user = command.value("user").or("");
+    str problem = HOARD_store.mirror_problem(url, token_env, user);
+    if (problem != "") {
+        return Result<void, str>.Err(problem);
+    }
+    entry.mirror_url = url;
+    entry.mirror_token_env = token_env;
+    entry.mirror_user = user;
+    // A hook written before mirroring existed does not start the mirror
+    // push; writing it again brings it up to date.
+    write_hook(path)?;
+    HOARD_store.save(path, config)?;
+    print(name + " now mirrors to " + url);
+    if (token_env != "" && os.env(token_env).is_none()) {
+        print("note: " + token_env + " is not set here; the server must have it in its environment");
+    }
+    return Result<void, str>.Ok;
+}
+
+Result<void, str> cmd_mirror_now(str path, args.Parsed command) {
+    str name = command.positional("name");
+    if (!command.is_flag_set("hook")) {
+        print(HOARD_mirror.push(path, name)?);
+        return Result<void, str>.Ok;
+    }
+    // From the hook, in the background, its output appended to mirror.log:
+    // a repository without a mirror says nothing, and every outcome is one
+    // line with the time.
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    if (!HOARD_mirror.has_mirror(config, name)) {
+        return Result<void, str>.Ok;
+    }
+    str stamp = date.iso(date.now());
+    match (HOARD_mirror.push(path, name)) {
+        case Ok(str line): {
+            print(stamp + " " + line);
+        }
+        case Err(str problem): {
+            print(stamp + " " + problem);
+        }
     }
     return Result<void, str>.Ok;
 }
