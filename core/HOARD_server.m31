@@ -151,6 +151,16 @@ void serve_connection(net.Conn connection, View view, HOARD_auth.Guard guard, st
         case Err(_): {
         }
     }
+    // A response goes out as a head and then body pieces, in separate
+    // writes. With Nagle's algorithm on, the last small write waits for the
+    // peer's delayed ACK, which cost 40 ms per request on a kept-alive
+    // connection -- every request git sends after its first.
+    match (connection.set_nodelay(true)) {
+        case Ok(_): {
+        }
+        case Err(_): {
+        }
+    }
     str peer = connection.peer().ip_address().to_str();
     for (int served in 0 .. MAX_REQUESTS) {
         match (http.read_request_stream(connection)) {
