@@ -354,6 +354,50 @@ def mono(argv):
     print("%.3f" % time.time())
 
 
+# download BASE TARGET OUT: stream a GET to OUT; exit 0 only on a 200.
+def download(argv):
+    base, target, out = argv
+    host, port = base.rsplit(":", 1)
+    c = http.client.HTTPConnection(host, int(port), timeout=120)
+    c.request("GET", target)
+    r = c.getresponse()
+    with open(out, "wb") as f:
+        while True:
+            piece = r.read(65536)
+            if not piece:
+                break
+            f.write(piece)
+    c.close()
+    sys.exit(0 if r.status == 200 else 1)
+
+
+# abort BASE TARGET: read the head and about 1 MB of the body, then hang up.
+def abort(argv):
+    base, target = argv
+    host, port = base.rsplit(":", 1)
+    c = http.client.HTTPConnection(host, int(port), timeout=60)
+    c.request("GET", target)
+    r = c.getresponse()
+    r.read(1 << 20)
+    c.sock.close()
+    print(r.status)
+
+
+# archiving: how many `git archive` processes are running.
+def archiving(argv):
+    n = 0
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % name, "rb") as f:
+                if b"\0archive\0--format=tar.gz" in f.read():
+                    n += 1
+        except OSError:
+            pass
+    print(n)
+
+
 cmd = sys.argv[1]
 globals()[cmd](sys.argv[2:]) if cmd != "free_port" else free_port()
 PYEOF
@@ -472,7 +516,18 @@ check "no admin lock is left behind after the setup commands" $?
 PORT=$(py free_port)
 BASE="127.0.0.1:$PORT"
 WORKERS=8
-env -i PATH="$PATH" HOME="$T/home" GIT_CONFIG_NOSYSTEM=1 \
+# Every git the server (and the hook it runs) starts goes through this
+# wrapper, which logs its arguments: the tarball checks look in the log to
+# show that a refused tag name never reached git.
+REAL_GIT=$(command -v git)
+mkdir -p "$T/bin"
+cat >"$T/bin/git" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$*" >>"$T/git-calls.log"
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$T/bin/git"
+env -i PATH="$T/bin:$PATH" HOME="$T/home" GIT_CONFIG_NOSYSTEM=1 \
     "$HOARD_BIN" --config "$CFG" -serve --listen "$BASE" --workers "$WORKERS" \
     >"$T/server.out" 2>"$T/server.err" </dev/null &
 SPID=$!
@@ -664,6 +719,103 @@ ELAPSED=$((SECONDS - SECONDS_AT_START))
 [ "$ELAPSED" -lt 20 ]
 check "sections 1-4, 7 and 8 finished without a stalled request (< 20 s)" $? "$ELAPSED s"
 
+section "8b. tag tarballs"
+git -C "$W" tag -a v1.0 -m "release 1.0" "$SECOND"
+git -C "$W" tag light "$FIRST"
+git -C "$W" tag rel/x "$SECOND"
+g -C "$W" push "$(aurl "$ALICE" /pub.git)" v1.0 light rel/x
+check "alice pushes tags to pub" $? "$(glast)"
+g -C "$W" push "$(aurl "$ALICE" /priv.git)" v1.0
+check "alice pushes a tag to priv" $? "$(glast)"
+get /pub/archive/v1.0.tar.gz
+cp "$T/r.b" "$T/pub-v1.0.tar.gz"
+[ "$ST" = 200 ] && [ "$(header content-type)" = application/gzip ]
+check "GET /pub/archive/v1.0.tar.gz is 200 application/gzip" $? "status $ST, $(header content-type)"
+[ "$(header content-disposition)" = 'attachment; filename="pub-v1.0.tar.gz"' ]
+check "...named pub-v1.0.tar.gz as an attachment" $? "$(header content-disposition)"
+case $(header cache-control) in *immutable*) true ;; *) false ;; esac
+check "...cacheable as immutable (public repository)" $? "$(header cache-control)"
+git -C "$W" archive --format=tar.gz --prefix=pub-v1.0/ v1.0 >"$T/local-v1.0.tar.gz"
+tar tzf "$T/pub-v1.0.tar.gz" >"$T/served.list" 2>/dev/null && tar tzf "$T/local-v1.0.tar.gz" >"$T/local.list" && cmp -s "$T/served.list" "$T/local.list"
+check "the tarball lists the same files as a local git archive" $? "$(diff "$T/served.list" "$T/local.list" 2>&1 | head -5)"
+tar xzOf "$T/pub-v1.0.tar.gz" pub-v1.0/README.md 2>/dev/null | cmp -s - "$W/README.md"
+check "a file in the tarball is byte-identical" $?
+! grep -q '^pub-v1.0/docs/' "$T/served.list"
+check "the tarball is of the tag, not of the branch tip" $? "$(head -5 "$T/served.list")"
+get /pub/archive/light.tar.gz
+[ "$ST" = 200 ] && tar tzf "$T/r.b" 2>/dev/null | grep -q '^pub-light/README.md$' && ! tar tzf "$T/r.b" 2>/dev/null | grep -q notes.txt
+check "a lightweight tag's tarball is served too" $? "status $ST"
+req HEAD /pub/archive/v1.0.tar.gz
+[ "$ST" = 200 ] && [ ! -s "$T/r.b" ] && [ "$(header content-type)" = application/gzip ]
+check "HEAD of a tarball: 200, the headers, no body" $? "status $ST, $(wc -c <"$T/r.b") bytes"
+req POST /pub/archive/v1.0.tar.gz -d x
+[ "$ST" = 405 ]
+check "POST to a tarball is 405" $? "status $ST"
+get /pub/archive/nosuch.tar.gz
+[ "$ST" = 404 ]
+check "a tag that does not exist is 404" $? "status $ST"
+req HEAD /pub/archive/nosuch.tar.gz
+[ "$ST" = 404 ]
+check "...for HEAD too" $? "status $ST"
+get /pub/archive/main.tar.gz
+[ "$ST" = 404 ]
+check "a branch name is not a tag (404)" $? "status $ST"
+get "/pub/archive/$SECOND.tar.gz"
+[ "$ST" = 404 ]
+check "a commit name is not a tag (404)" $? "status $ST"
+get /priv/archive/v1.0.tar.gz
+[ "$ST" = 401 ] && ! tar tzf "$T/r.b" >/dev/null 2>&1
+check "anonymous request for a private tarball is 401, as for its pages" $? "status $ST"
+get /priv/archive/v1.0.tar.gz -u "$CAROL"
+CAROL_ST=$ST
+get /priv/archive/nosuch.tar.gz -u "$CAROL"
+[ "$CAROL_ST" = 404 ] && [ "$ST" = 404 ]
+check "carol (no grant) gets the same 404 for a real and a missing private tag" $? "status $CAROL_ST, $ST"
+get /priv/archive/v1.0.tar.gz -u "$BOB"
+[ "$ST" = 200 ] && tar tzf "$T/r.b" 2>/dev/null | grep -q '^priv-v1.0/README.md$'
+check "bob (reader) downloads priv's tarball" $? "status $ST"
+case $(header cache-control) in *private*no-store*) true ;; *) false ;; esac
+check "...sent Cache-Control: private, no-store" $? "$(header cache-control)"
+LONG=$(printf 'a%.0s' $(seq 1 300))
+for target in \
+    "/pub/archive/..tar.gz" \
+    "/pub/archive/%2e%2e.tar.gz" \
+    "/pub/archive/v1.0..tar.gz" \
+    "/pub/archive/..%2fv1.0.tar.gz" \
+    "/pub/archive/-x.tar.gz" \
+    "/pub/archive/--output=x.tar.gz" \
+    "/pub/archive/--output=%2ftmp%2fhoard-pwned.tar.gz" \
+    "/pub/archive/v1.0%5E%7Btree%7D.tar.gz" \
+    "/pub/archive/v1.0~1.tar.gz" \
+    "/pub/archive/v1.0:README.md.tar.gz" \
+    "/pub/archive/%40%7B-1%7D.tar.gz" \
+    "/pub/archive/rel/x.tar.gz" \
+    "/pub/archive/rel%2fx.tar.gz" \
+    "/pub/archive/v1.0%00.tar.gz" \
+    "/pub/archive/$LONG.tar.gz" \
+    "/pub/archive/.tar.gz" \
+    "/pub/archive/v1.0" \
+    "/pub/archive/v1.0.zip" \
+    "/pub/archive/v1.0.tar.gz/x" \
+    "/priv/archive/..%2f..%2fpub%2farchive%2fv1.0.tar.gz"; do
+    get "$target"
+    [ "$ST" -ge 400 ] && [ "$ST" -lt 500 ] && ! tar tzf "$T/r.b" >/dev/null 2>&1
+    check "refused: $target" $? "status $ST"
+done
+BAD_CALLS=$(grep -E 'refs/tags/([-.]|rel/|[^ ]*\.\.|[^ ]*[~:@]|[^ ]*\^\{tree|a{100})|--output' "$T/git-calls.log" 2>/dev/null)
+[ -z "$BAD_CALLS" ] && grep -q 'rev-parse --verify --quiet refs/tags/v1.0^{commit}' "$T/git-calls.log"
+check "no refused name reached git (the git log shows only valid tags)" $? "$BAD_CALLS"
+[ ! -e /tmp/hoard-pwned.tar.gz ]
+check "no --output file was written" $?
+get /pub/
+[ "$ST" = 200 ] && body_has 'href="archive/v1.0.tar.gz"' && body_has 'href="archive/light.tar.gz"'
+check "the summary links each tag's tarball" $? "status $ST"
+body_has 'rel/x' && ! body_has 'archive/rel/x'
+check "a tag outside the tarball alphabet is listed without a link" $?
+get /priv/ -u "$BOB"
+body_has 'href="archive/v1.0.tar.gz"'
+check "priv's summary links its tag's tarball for bob" $?
+
 # --- 5-6: a large push, memory, and concurrency -----------------------------------------
 
 section "5. a 100 MB binary push streams"
@@ -723,6 +875,41 @@ check "big's pages list the blob without inlining it" $? "status $ST"
 get /big/file/blob.bin.html
 [ "$ST" = 200 ] && body_has "too large to show (104857600 bytes)"
 check "the blob's page says it is too large to show" $? "status $ST"
+
+section "5b. a large tag tarball streams"
+git -C "$BW" tag v100
+g -C "$BW" push "$(aurl "$ALICE" /big.git)" v100
+check "push of a tag on the 100 MB commit" $? "$(glast)"
+py sampled "$SPID" "$T/arch.out" python3 -I "$T/helper.py" download "$BASE" /big/archive/v100.tar.gz "$T/big.tar.gz"
+av() { sed -n "s/^$1 //p" "$T/arch.out" | head -n 1; }
+[ "$(av rc)" = 0 ]
+check "the 100 MB tarball downloads" $? "$(av err)"
+note "download took $(av secs) s ($(wc -c <"$T/big.tar.gz" | tr -d ' ') bytes); server RSS peak $(av rss_max) kB"
+if [ "$HAVE_PROC" = 1 ]; then
+    [ "$(av rss_max)" -gt 0 ] && [ "$(av rss_max)" -lt 65536 ]
+    check "server RSS stayed far below the tarball's size (streamed)" $? "peak $(av rss_max) kB"
+else
+    skip "server RSS stayed far below the tarball's size (streamed)" "no /proc"
+fi
+tar xzOf "$T/big.tar.gz" big-v100/blob.bin 2>/dev/null | cmp -s - "$BW/blob.bin"
+check "the blob in the tarball is byte-identical" $?
+rm -f "$T/big.tar.gz"
+if [ "$HAVE_PROC" = 1 ]; then
+    py abort "$BASE" /big/archive/v100.tar.gz >/dev/null
+    left=1
+    for _ in $(seq 1 50); do
+        left=$(py archiving)
+        [ "$left" = 0 ] && break
+        sleep 0.1
+    done
+    [ "$left" = 0 ]
+    check "a client that hangs up mid-tarball leaves no git archive running" $? "$left still running"
+else
+    skip "a client that hangs up mid-tarball leaves no git archive running" "no /proc"
+fi
+get /
+[ "$ST" = 200 ]
+check "the server still answers after the aborted download" $? "status $ST"
 rm -rf "$FRESH" "$BW"
 
 # --- 9: path attacks --------------------------------------------------------------------

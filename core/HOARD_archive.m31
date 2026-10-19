@@ -1,0 +1,257 @@
+// Source tarballs of tags: `/<repo>/archive/<tag>.tar.gz`, made by
+// `git archive` and streamed to the client as git writes it.
+//
+// Only tags are served, never branches or commit names, so a URL always
+// means the same bytes and may be cached. The tag name is checked against a
+// strict alphabet (HOARD_store.is_valid_tag_name) before git is run at all,
+// then resolved to its commit once; the archive is made from that commit, so
+// a tag moved mid-request cannot mix two trees.
+//
+// The tarball is never held in memory: git's stdout is copied to the client
+// in 64 KiB pieces. A client that disconnects drops the `Proc`, which kills
+// and reaps git.
+
+import core.HOARD_cgi;
+import core.HOARD_store;
+import io;
+import net;
+import net.http;
+import os;
+import proc;
+
+/// Where archives live below `/<repo>`. The page generator never writes a
+/// page under `archive/`, so the two cannot meet.
+pub const str PREFIX = "/archive/";
+/// The only format served.
+pub const str SUFFIX = ".tar.gz";
+const int PIECE = 65536;
+// How long a public tarball may be cached. A tag is not supposed to move;
+// a day bounds the damage when one does.
+const str PUBLIC_CACHE = "public, max-age=86400, immutable";
+
+/// The tag `rest` (the path after `/<repo>`) asks for, or None when it is not
+/// `/archive/<tag>.tar.gz` with a valid tag name.
+pub Option<str> tag_of(str rest) {
+    if (!rest.starts_with(PREFIX) || !rest.ends_with(SUFFIX)) {
+        return Option<str>.None;
+    }
+    if (rest.size() <= PREFIX.size() + SUFFIX.size()) {
+        return Option<str>.None;
+    }
+    str tag = rest.substr(PREFIX.size(), rest.size() - SUFFIX.size());
+    if (!HOARD_store.is_valid_tag_name(tag)) {
+        return Option<str>.None;
+    }
+    return Option<str>.Some(tag);
+}
+
+/// One archive to send.
+pub type Archive {
+    pub str repo;
+    pub str tag;
+    pub str git_directory;
+    pub str path_env;
+    pub bool is_public;
+}
+
+// The environment git runs in: nothing inherited steers it, and no user's
+// config can swap the compressor.
+Map<str, str> clean_env(str path_env) {
+    Map<str, str> env = {"PATH": path_env, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1"};
+    return env;
+}
+
+List<str> git_command(Archive archive, List<str> arguments) {
+    List<str> argv = ["git", "--git-dir", archive.git_directory];
+    for (str argument in arguments) {
+        argv.push(argument);
+    }
+    return argv;
+}
+
+/// The commit `refs/tags/<tag>` points at (through an annotated tag), or
+/// None when there is no such tag or it does not name a commit.
+pub Option<str> commit_of(Archive archive) {
+    List<str> argv = git_command(archive, ["rev-parse", "--verify", "--quiet", "refs/tags/" + archive.tag + "^{commit}"]);
+    match (proc.run(argv, env: Option<Map<str, str>>.Some(clean_env(archive.path_env)), should_check: false, is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (!done.is_success()) {
+                return Option<str>.None;
+            }
+            match (done.stdout.utf8()) {
+                case Some(str text): {
+                    str sha = text.trim();
+                    if (sha.size() == 40 || sha.size() == 64) {
+                        return Option<str>.Some(sha);
+                    }
+                    return Option<str>.None;
+                }
+                case None: {
+                    return Option<str>.None;
+                }
+            }
+        }
+        case Err(_): {
+            return Option<str>.None;
+        }
+    }
+}
+
+void log_line(str text) {
+    io.eprint("hoard: " + text + "\n");
+}
+
+// The stderr thread: log what git says, a line at a time.
+void log_stderr(proc.Pipe stream, str label) {
+    while (true) {
+        match (io.read_line_of(stream, 8192)) {
+            case Ok(Option<str> maybe): {
+                match (maybe) {
+                    case Some(str line): {
+                        log_line(label + ": " + line);
+                    }
+                    case None: {
+                        return;
+                    }
+                }
+            }
+            case Err(_): {
+                return;
+            }
+        }
+    }
+}
+
+// A plain-text answer, after which the connection closes.
+HOARD_cgi.Next refuse(net.Conn connection, http.Request request, int status, str message) {
+    http.Response reply = http.text_response(message + "\n", status: status);
+    match (http.write_response(connection, request, reply, false)) {
+        case Ok: {
+        }
+        case Err(_): {
+        }
+    }
+    return HOARD_cgi.Next.Close;
+}
+
+/// Send the tarball of `archive.tag`, whose commit is `sha` (from
+/// `commit_of`). A `HEAD` gets the headers and git is not run.
+pub HOARD_cgi.Next serve(net.Conn connection, http.RequestStream incoming, Archive archive, str sha) {
+    http.Request request = incoming.request();
+    str base = archive.repo + "-" + archive.tag;
+    http.Response reply = http.response(200);
+    reply.set("content-type", "application/gzip");
+    // Both names are from a quote-free alphabet, so the filename needs no
+    // escaping.
+    reply.set("content-disposition", "attachment; filename=\"" + base + SUFFIX + "\"");
+    reply.set("x-content-type-options", "nosniff");
+    if (archive.is_public) {
+        reply.set("cache-control", PUBLIC_CACHE);
+    } else {
+        reply.set("cache-control", "private, no-store");
+    }
+    bool is_keep_alive = incoming.is_finished() && http.should_keep_alive(request, reply);
+    if (request.method() == "HEAD") {
+        match (http.start_response(connection, request, reply, is_keep_alive)) {
+            case Ok(http.BodyWriter writer): {
+                return HOARD_cgi.next_of(writer.is_keep_alive());
+            }
+            case Err(_): {
+                return HOARD_cgi.Next.Close;
+            }
+        }
+    }
+    str label = "GET /" + archive.repo + PREFIX + archive.tag + SUFFIX;
+    List<str> argv = git_command(archive, ["archive", "--format=tar.gz", "--prefix=" + base + "/", sha]);
+    match (proc.start(argv, env: Option<Map<str, str>>.Some(clean_env(archive.path_env)))) {
+        case Ok(proc.Proc child): {
+            spawn log_stderr(child.take_stderr(), clone(label));
+            match (child.take_stdin().close()) {
+                case Ok(_): {
+                }
+                case Err(_): {
+                }
+            }
+            return stream(connection, request, reply, is_keep_alive, child, label);
+        }
+        case Err(proc.Error failure): {
+            log_line(label + ": could not start git archive: " + failure.to_str());
+            return refuse(connection, request, 500, "the archive could not be made");
+        }
+    }
+}
+
+// Copy git's stdout to the client. The first piece is read before the head
+// goes out, so a git that fails at once is still a clean 500.
+HOARD_cgi.Next stream(net.Conn connection, http.Request request, http.Response reply, bool is_keep_alive, proc.Proc child, str label) {
+    proc.Pipe output = child.take_stdout();
+    bytes first = [];
+    match (output.read(PIECE)) {
+        case Ok(bytes piece): {
+            first = piece;
+        }
+        case Err(_): {
+        }
+    }
+    if (first.size() == 0) {
+        log_line(label + ": git archive wrote nothing " + finish(child));
+        return refuse(connection, request, 500, "the archive could not be made");
+    }
+    match (http.start_response(connection, request, reply, is_keep_alive)) {
+        case Ok(http.BodyWriter writer): {
+            bytes piece = first;
+            while (piece.size() > 0) {
+                match (writer.write(piece)) {
+                    case Ok: {
+                    }
+                    case Err(_): {
+                        // The client went away. Dropping the child kills
+                        // and reaps git.
+                        return HOARD_cgi.Next.Close;
+                    }
+                }
+                match (output.read(PIECE)) {
+                    case Ok(bytes next): {
+                        piece = next;
+                    }
+                    case Err(_): {
+                        return HOARD_cgi.Next.Close;
+                    }
+                }
+            }
+            str status = finish(child);
+            if (status != "") {
+                // The body is already short of a valid gzip stream; ending
+                // it cleanly would pass it off as whole.
+                log_line(label + ": git archive " + status);
+                return HOARD_cgi.Next.Close;
+            }
+            match (writer.finish()) {
+                case Ok: {
+                    return HOARD_cgi.next_of(writer.is_keep_alive());
+                }
+                case Err(_): {
+                    return HOARD_cgi.Next.Close;
+                }
+            }
+        }
+        case Err(_): {
+            return HOARD_cgi.Next.Close;
+        }
+    }
+}
+
+// Reap git; "" for a clean exit, else how it ended.
+str finish(proc.Proc child) {
+    match (child.wait()) {
+        case Ok(os.ExitStatus status): {
+            if (status.is_success()) {
+                return "";
+            }
+            return status.to_str();
+        }
+        case Err(proc.Error failure): {
+            return failure.to_str();
+        }
+    }
+}

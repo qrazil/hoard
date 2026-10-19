@@ -1,7 +1,9 @@
-// Unit tests for HOARD_html and the text helpers of HOARD_pages.
+// Unit tests for HOARD_html, the text helpers of HOARD_pages and the tag
+// names HOARD_archive accepts.
 //
 // Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
 
+import core.HOARD_archive;
 import core.HOARD_html;
 import core.HOARD_pages;
 
@@ -93,4 +95,16 @@ str want = "<b>diff --git a/f b/f</b>\n<b>--- a/f</b>\n<b>+++ b/f</b>\n<span cla
 tally.same("diff_markup: classes and escaping", HOARD_pages.diff_markup(diff), want);
 tally.same("diff_markup: empty", HOARD_pages.diff_markup(""), "");
 tally.same("diff_markup: stat line plain", HOARD_pages.diff_markup(" f | 2 +-"), " f | 2 +-");
+// tag_of
+tally.same("tag_of: a release", HOARD_archive.tag_of("/archive/v1.2.3.tar.gz").or(""), "v1.2.3");
+tally.same("tag_of: underscore first", HOARD_archive.tag_of("/archive/_rc-1.tar.gz").or(""), "_rc-1");
+tally.check("tag_of: no tag", HOARD_archive.tag_of("/archive/.tar.gz").is_none());
+tally.check("tag_of: other format", HOARD_archive.tag_of("/archive/v1.zip").is_none());
+tally.check("tag_of: not under archive/", HOARD_archive.tag_of("/file/v1.tar.gz").is_none());
+tally.check("tag_of: leading dash", HOARD_archive.tag_of("/archive/--output=x.tar.gz").is_none());
+tally.check("tag_of: leading dot", HOARD_archive.tag_of("/archive/.x.tar.gz").is_none());
+tally.check("tag_of: dot dot", HOARD_archive.tag_of("/archive/a..b.tar.gz").is_none());
+tally.check("tag_of: slash", HOARD_archive.tag_of("/archive/rel/x.tar.gz").is_none());
+tally.check("tag_of: revision syntax", HOARD_archive.tag_of("/archive/v1^{tree}.tar.gz").is_none() && HOARD_archive.tag_of("/archive/v1~1.tar.gz").is_none() && HOARD_archive.tag_of("/archive/v1:f.tar.gz").is_none());
+tally.check("tag_of: 100 bytes is the limit", HOARD_archive.tag_of("/archive/" + "a".repeat(100) + ".tar.gz").is_some() && HOARD_archive.tag_of("/archive/" + "a".repeat(101) + ".tar.gz").is_none());
 print(str(tally.passed) + " passed, " + str(tally.failed) + " failed");

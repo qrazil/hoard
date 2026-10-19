@@ -22,3 +22,7 @@ First version: the m31 port of orogit.
 - `TCP_NODELAY` on every connection: no 40 ms Nagle stall per kept-alive
   request.
 - SHA-512 comes from m31 0.7.0's `lib/crypto/sha512`.
+- Tag tarballs: `/<repo>/archive/<tag>.tar.gz` streams `git archive` in
+  constant memory, with the pages' access rules; strict tag names (no `/`,
+  no leading `-`, no `..`) are checked before git runs. The summary page
+  links each tag's tarball.
