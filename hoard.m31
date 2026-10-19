@@ -23,10 +23,12 @@ import core.HOARD_gc;
 import core.HOARD_pages;
 import core.HOARD_server;
 import core.HOARD_store;
+import date;
 import fs;
 import io;
 import os;
 import proc;
+import text;
 
 const str VERSION = "0.1.0";
 
@@ -51,6 +53,12 @@ addrepo.positional("name", help: "the repository name");
 args.Parser adopt = table.command("adopt", "take over an existing bare repository under repos/ (an orogit move)");
 adopt.flag("public", help: "anonymous users may read it");
 adopt.positional("name", help: "the repository name; repos/NAME.git must exist");
+args.Parser delrepo = table.command("delrepo", "drop a repository: it moves to repos/.trash, its pages are deleted");
+delrepo.flag("yes", help: "do it; without this nothing runs and the plan is shown");
+delrepo.positional("name", help: "the repository name");
+args.Parser renaming = table.command("rename", "rename a repository; its permissions go with it");
+renaming.positional("old", help: "the current name");
+renaming.positional("new", help: "the new name");
 args.Parser grant = table.command("grant", "give a user access to a repository");
 grant.positional("repo", help: "the repository");
 grant.positional("user", help: "the user");
@@ -74,6 +82,14 @@ str config_path = HOARD_store.absolute(given.value("config").or("hoard.json"), H
 List<args.Parsed> commands = given.commands();
 if (commands.size() == 0) {
     table.fail("hoard needs a command; see hoard --help", status: 64);
+}
+// What can be judged before anything runs is a usage error for the whole line.
+for (args.Parsed command in commands) {
+    str problem = line_problem(config_path, command);
+    if (problem != "") {
+        io.eprint("hoard: " + problem + "\n");
+        os.exit(64);
+    }
 }
 for (args.Parsed command in commands) {
     match (dispatch(config_path, command)) {
@@ -162,6 +178,12 @@ Result<void, str> change(str path, args.Parsed command) {
     }
     if (word == "addrepo" || word == "adopt") {
         return add_repo(path, config, command.positional("name"), command.is_flag_set("public"), word == "adopt");
+    }
+    if (word == "delrepo") {
+        return delete_repo(path, config, command.positional("name"));
+    }
+    if (word == "rename") {
+        return rename_repo(path, config, command.positional("old"), command.positional("new"));
     }
     if (word == "grant") {
         str repo = command.positional("repo");
@@ -408,6 +430,227 @@ Result<void, str> add_repo(str path, HOARD_store.Config config, str name, bool i
         print("created repository " + name + " at " + git_directory);
     }
     return Result<void, str>.Ok;
+}
+
+// --- deleting and renaming ---------------------------------------------------
+//
+// hoard never destroys a repository. -delrepo moves it to repos/.trash (a
+// rename on the same filesystem, so atomic) and prints how to restore or purge
+// it; `.trash` cannot be a repository name, so it is never served or listed.
+// Pages are derived, so they are deleted, never following a symlink.
+//
+// Both run under the admin lock, in an order where a crash leaves a state the
+// same command finishes when run again:
+//
+//     -delrepo   1. repos/NAME.git -> repos/.trash/NAME-<UTC time>.git
+//                2. the config entry goes   3. pages/NAME goes
+//     -rename    1. repos/OLD.git -> repos/NEW.git
+//                2. hoard.repo = NEW in it (the hook reads it)
+//                3. the config entry moves, permissions with it
+//                4. pages/NEW rebuilt (links carry the name), pages/OLD goes
+//
+// After step 1 the config still names the repository, and a second run sees
+// the directory gone (-delrepo) or already moved (-rename) and goes on. After
+// the config step only pages are wrong: -regen NEW, and remove pages/OLD.
+
+const str TRASH = ".trash";
+
+// Refusals the whole line gets before any command runs, as usage errors.
+str line_problem(str path, args.Parsed command) {
+    str word = command.word();
+    if (word == "delrepo") {
+        str name = command.positional("name");
+        if (!HOARD_store.is_valid_repo_name(name)) {
+            return "invalid repository name '" + name + "'";
+        }
+        if (!command.is_flag_set("yes")) {
+            return delete_plan(path, name) + "nothing was changed; add --yes to do it";
+        }
+    }
+    if (word == "rename") {
+        List<str> names = [command.positional("old"), command.positional("new")];
+        for (str name in names) {
+            if (!HOARD_store.is_valid_repo_name(name)) {
+                return "invalid repository name '" + name + "' (letters, digits, '.', '_', '-'; no '..', no .git suffix)";
+            }
+        }
+        if (command.positional("old") == command.positional("new")) {
+            return "-rename needs two different names";
+        }
+    }
+    return "";
+}
+
+str delete_plan(str path, str name) {
+    match (HOARD_store.load(path)) {
+        case Ok(HOARD_store.Config config): {
+            str plan = "-delrepo " + name + " would:\n";
+            if (!config.repos.contains(name)) {
+                plan = plan + "  (fail: there is no repository '" + name + "')\n";
+            }
+            plan = plan + "  move " + HOARD_store.repo_git_directory(config, path, name) + " to " + fs.join(fs.join(HOARD_store.repo_root(config, path), TRASH), name + "-<UTC time>.git") + "\n";
+            plan = plan + "  remove '" + name + "' and its permissions from " + path + "\n";
+            return plan + "  delete the pages in " + fs.join(HOARD_store.pages_root(config, path), name) + "\n";
+        }
+        case Err(str problem): {
+            return problem + "\n";
+        }
+    }
+}
+
+Result<void, str> move_path(str from_path, str to_path) {
+    match (fs.rename(from_path, to_path)) {
+        case Ok(_): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not move " + from_path + " to " + to_path + ": " + failure.to_str());
+        }
+    }
+}
+
+bool is_on_disk(str path) {
+    return fs.is_present(path) || fs.is_link(path);
+}
+
+// `<trash>/<name>-20261018T120000Z.git`, with `-2`, `-3`... after the time
+// if a repository of that name was deleted in the same second.
+str trash_path(str trash, str name) {
+    str stamp = text.replace(text.replace(date.iso(date.now()), "-", ""), ":", "");
+    str stem = name + "-" + stamp;
+    str candidate = fs.join(trash, stem + ".git");
+    int count = 2;
+    while (is_on_disk(candidate)) {
+        candidate = fs.join(trash, stem + "-" + count.to_str() + ".git");
+        count = count + 1;
+    }
+    return candidate;
+}
+
+// Delete a repository's pages directory. `fs.rmtree` unlinks a symlink inside
+// the tree rather than following it, refuses one on the way down, and traps
+// on a path outside `root`; a valid name is one segment, so it never is.
+Result<void, str> remove_pages(str root, str name) {
+    str pages = fs.join(root, name);
+    if (!is_on_disk(pages)) {
+        return Result<void, str>.Ok;
+    }
+    match (fs.rmtree(pages, root)) {
+        case Ok(_): {
+            return Result<void, str>.Ok;
+        }
+        case Err(io.Error failure): {
+            return Result<void, str>.Err("could not delete the pages in " + pages + ": " + failure.to_str() + " (a symlink is never followed; remove it by hand)");
+        }
+    }
+}
+
+Result<void, str> delete_repo(str path, HOARD_store.Config config, str name) {
+    HOARD_store.Repo entry = repo_of(config, name)?;
+    str git_directory = HOARD_store.repo_git_directory(config, path, name);
+    str moved = "";
+    if (is_on_disk(git_directory)) {
+        str trash = fs.join(HOARD_store.repo_root(config, path), TRASH);
+        HOARD_store.make_dirs(trash)?;
+        moved = trash_path(trash, name);
+        move_path(git_directory, moved)?;
+    }
+    config.repos.remove(name);
+    match (HOARD_store.save(path, config)) {
+        case Ok: {
+        }
+        case Err(str problem): {
+            return Result<void, str>.Err(problem + "; the repository is at " + moved + " and still in the config: run -delrepo " + name + " --yes again");
+        }
+    }
+    str shown = "private";
+    if (entry.is_public) {
+        shown = "public";
+    }
+    print("deleted repository " + name + " (it was " + shown + ", readers=" + entry.readers.join(",") + " writers=" + entry.writers.join(",") + ")");
+    if (moved == "") {
+        print("there was no " + git_directory + " to keep");
+    } else {
+        print("the repository is kept at " + moved);
+        print("  restore: mv '" + moved + "' '" + git_directory + "' && hoard --config '" + path + "' -adopt " + name + "   (then grant again)");
+        print("  purge:   rm -rf '" + moved + "'");
+    }
+    remove_pages(HOARD_store.pages_root(config, path), name)?;
+    return Result<void, str>.Ok;
+}
+
+// A git config value of a repository, "" when unset or unreadable.
+str git_value(str git_directory, str key) {
+    match (proc.run(["git", "--git-dir", git_directory, "config", "--get", key], is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (done.is_success()) {
+                return done.stdout.utf8().or("").trim();
+            }
+            return "";
+        }
+        case Err(_): {
+            return "";
+        }
+    }
+}
+
+Result<void, str> rename_repo(str path, HOARD_store.Config config, str old_name, str new_name) {
+    HOARD_store.Repo entry = repo_of(config, old_name)?;
+    if (config.repos.contains(new_name)) {
+        return Result<void, str>.Err("repository '" + new_name + "' already exists");
+    }
+    str from_directory = HOARD_store.repo_git_directory(config, path, old_name);
+    str to_directory = HOARD_store.repo_git_directory(config, path, new_name);
+    str again = "; run -rename " + old_name + " " + new_name + " again to finish";
+    if (is_on_disk(to_directory)) {
+        // Only a rename that stopped after step 1 leaves the new directory,
+        // without the old one, still naming itself after either.
+        str named = git_value(to_directory, "hoard.repo");
+        if (is_on_disk(from_directory) || (named != old_name && named != new_name)) {
+            return Result<void, str>.Err(to_directory + " already exists on disk");
+        }
+    } else {
+        if (!fs.is_directory(from_directory)) {
+            return Result<void, str>.Err(from_directory + " does not exist");
+        }
+        move_path(from_directory, to_directory)?;
+    }
+    match (git(["git", "--git-dir", to_directory, "config", "hoard.repo", new_name])) {
+        case Ok: {
+        }
+        case Err(str problem): {
+            return Result<void, str>.Err(problem + again);
+        }
+    }
+    config.repos.remove(old_name);
+    config.repos.set(new_name, entry);
+    match (HOARD_store.save(path, config)) {
+        case Ok: {
+        }
+        case Err(str problem): {
+            return Result<void, str>.Err(problem + again);
+        }
+    }
+    print("renamed repository " + old_name + " to " + new_name + " at " + to_directory);
+    // Pages link by name, so they are rebuilt rather than moved.
+    str root = HOARD_store.pages_root(config, path);
+    str later = "; run -regen " + new_name + " and delete " + fs.join(root, old_name) + " by hand";
+    match (remove_pages(root, new_name)) {
+        case Ok: {
+        }
+        case Err(str problem): {
+            return Result<void, str>.Err(problem + later);
+        }
+    }
+    match (HOARD_pages.regen(to_directory, fs.join(root, new_name), new_name, config.base_url, true)) {
+        case Ok(str line): {
+            print(line);
+        }
+        case Err(str problem): {
+            return Result<void, str>.Err(problem + later);
+        }
+    }
+    return remove_pages(root, old_name);
 }
 
 Result<void, str> cmd_regen(str path, args.Parsed command) {

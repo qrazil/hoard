@@ -36,6 +36,8 @@ hoard --config data/hoard.json -serve --workers 16
 | `-deluser NAME` | remove a user and all their grants |
 | `-addrepo NAME [--public]` | create a bare repository |
 | `-adopt NAME [--public]` | take over an existing `repos/NAME.git` (moving from orogit) |
+| `-delrepo NAME --yes` | move `repos/NAME.git` to `repos/.trash/` and delete its pages; prints how to restore or purge it. Without `--yes` it shows the plan and exits 64 |
+| `-rename OLD NEW` | rename a repository, keeping its permissions; rebuilds its pages |
 | `-grant REPO USER read\|write`, `-revoke REPO USER` | permissions |
 | `-visibility REPO public\|private` | anonymous read access |
 | `-proxies [--set ENTRY...]` | show or replace the trusted proxies (IPs, IPv4 CIDR blocks) |

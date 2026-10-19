@@ -17,7 +17,7 @@ The same feature set as orogit, nothing more in 0.1:
 | Damping | Failed logins counted per client address (walked back through trusted proxies in `X-Forwarded-For`). Five failures in 10 minutes lock the address out for 60 s, doubling per further failure, capped at 15 min. Each failure is answered 250 ms late. |
 | Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary, log, files, one page per file and per commit. |
 | Index | `/` lists the repositories the requester may read; `/?login` asks for credentials. |
-| Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`. |
+| Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-adopt`, `-delrepo --yes`, `-rename`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`. |
 
 URL layout (unchanged from orogit):
 
@@ -167,6 +167,44 @@ subprocesses.
   nosniff` and `Referrer-Policy: same-origin`. Private repositories add
   `Cache-Control: private, no-store`.
 
+### 3.6 Deleting and renaming a repository
+
+orogit has neither. hoard never destroys a repository: deleting one is the
+admin's decision, and undoing a mistake must not need a backup.
+
+- `-delrepo NAME --yes` moves `repos/NAME.git` to
+  `repos/.trash/NAME-<UTC time>.git` (a rename within `repo_root`, so atomic;
+  `-2`, `-3`... if that name is taken), drops the config entry, and deletes
+  `pages/NAME` with `fs.rmtree`, which unlinks a symlink inside the tree
+  rather than following it and refuses one at the top. It prints where the
+  repository went, its old permissions, and the two commands to restore it
+  (`mv` back, then `-adopt` and grant again) or purge it (`rm -rf`).
+- Without `--yes` it runs nothing on the line, prints the plan and exits 64,
+  like any other usage error. Invalid names to `-delrepo` and `-rename` are
+  usage errors too.
+- `.trash` cannot be a repository name (a name starts with a letter, digit or
+  `_`), so the server never routes to it and the index never lists it.
+- `-rename OLD NEW` refuses a NEW that is configured or already on disk. Pages
+  link by repository name, so they are rebuilt under NEW, not moved.
+
+Both run under the admin lock, in an order that leaves a crash recoverable by
+running the same command again:
+
+| Step | `-delrepo` | `-rename` |
+|---|---|---|
+| 1 | move the repository into `.trash` | move `OLD.git` to `NEW.git` |
+| 2 | save the config without it | set `hoard.repo = NEW` in it (the hook reads it) |
+| 3 | delete its pages | save the config: the entry moves, permissions with it |
+| 4 | | rebuild `pages/NEW`, delete `pages/OLD` |
+
+After step 1 the config still names the repository. A second `-delrepo` finds
+no directory and finishes; a second `-rename` finds `NEW.git` without `OLD.git`,
+naming itself OLD or NEW in `hoard.repo`, and carries on from step 2. After the
+config is saved only pages can be wrong: `-regen NEW`, and remove the old pages
+directory by hand. The server does not take the lock, so a push in flight
+while its repository is renamed may fail; the client pushes again to the new
+URL.
+
 ## 4. Testing
 
 - Unit tests (`tests/t_*.m31`): names, config normalisation, permissions,
@@ -217,7 +255,6 @@ user makes.
 ## 8. Not in 0.1
 
 - SSH transport (m31 has the crypto; it is a later decision).
-- Repository deletion (`-delrepo`), which orogit lacks too.
 - Log rotation, backups, TLS (rpxy terminates TLS).
 - Graceful shutdown on SIGTERM (m31 has no signal handling). In-flight
   requests are cut, as they are with orogit.
