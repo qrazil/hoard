@@ -10,7 +10,8 @@
 //       "base_url": "https://git.example.org",
 //       "trusted_proxies": ["127.0.0.1"],
 //       "users": {"alice": {"hash": "$6$salt$..."}},
-//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}}
+//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}},
+//       "gc_hours": 24
 //     }
 //
 // Relative paths are relative to the directory holding the config file. Keys
@@ -39,6 +40,8 @@ pub type Config {
     pub Map<str, Repo> repos;
     // Top-level keys this program does not read, written back unchanged.
     pub Map<str, json.Value> extra;
+    // Hours between `git gc` passes while serving (HOARD_gc); 0 is off.
+    pub int gc_hours = 24;
 }
 
 pub Config default_config() {
@@ -225,6 +228,12 @@ pub Result<Config, str> parse(str text) {
             config.pages_root = text_of(value, config.pages_root);
         } else if (key == "base_url") {
             config.base_url = text_of(value, "");
+        } else if (key == "gc_hours") {
+            int hours = int_of(value, -1);
+            if (hours < 0 || hours > 8760) {
+                return Result<Config, str>.Err("gc_hours must be a whole number of hours from 0 (off) to 8760");
+            }
+            config.gc_hours = hours;
         } else if (key == "trusted_proxies") {
             for (json.Value item in array_of(value)) {
                 str entry = text_of(item, "");
@@ -273,6 +282,32 @@ str text_of(json.Value value, str fallback) {
             return fallback;
         }
         case Int(_): {
+            return fallback;
+        }
+        case Float(_): {
+            return fallback;
+        }
+        case Array(_): {
+            return fallback;
+        }
+        case Object(_): {
+            return fallback;
+        }
+    }
+}
+
+int int_of(json.Value value, int fallback) {
+    match (value) {
+        case Int(int number): {
+            return number;
+        }
+        case Null: {
+            return fallback;
+        }
+        case Bool(_): {
+            return fallback;
+        }
+        case Str(_): {
             return fallback;
         }
         case Float(_): {
@@ -435,6 +470,9 @@ pub Result<str, str> render(Config config) {
     out.set("pages_root", json.Value.Str(config.pages_root));
     if (config.base_url != "") {
         out.set("base_url", json.Value.Str(config.base_url));
+    }
+    if (config.gc_hours != 24) {
+        out.set("gc_hours", json.Value.Int(config.gc_hours));
     }
     out.set("trusted_proxies", json.Value.Array(strings(config.trusted_proxies)));
     Map<str, json.Value> users = {};

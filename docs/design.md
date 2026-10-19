@@ -77,6 +77,8 @@ install.sh               curl installer
 main thread       accept() ──send(Conn)──► conns: Chan<net.Conn>(64)
 worker 1..N       recv(conns) → serve one connection to the end, then the next
 guard thread      owns the login cache and the failure table
+housekeeper       every gc_hours (default 24): git gc where loose objects
+                  or several packs are found (HOARD_gc; -gc runs one pass)
 ```
 
 - Workers: `N = 16` by default (`--workers`). A long clone occupies one

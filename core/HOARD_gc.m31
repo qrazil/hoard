@@ -1,0 +1,120 @@
+// Repository housekeeping: `git gc` on a timer.
+//
+// git unpacks a push of fewer than 100 objects into loose files and only
+// repacks on its own (`gc --auto` after receive-pack) past about 6700 of
+// them, so a repository that takes many small pushes collects loose objects
+// that every clone has to compress again. The benchmark against orogit showed
+// a 24 MB repository cloning in 3.55 s loose and 0.22 s packed.
+//
+// So `serve` runs a pass every `gc_hours` hours (config, default 24; 0 turns
+// it off), as Gitea does on its own schedule. A pass skips any repository
+// that is already one pack and no loose objects -- the state `git gc` leaves
+// -- so a repository nobody pushed to costs one `git count-objects`. git's gc
+// is safe to run beside pushes and clones; its prune keeps two weeks' grace.
+
+import core.HOARD_store;
+import io;
+import os;
+import proc;
+import timer;
+
+const int HOUR_MS = 3600000;
+
+/// The housekeeping thread's body: sleep, run a pass, for ever. The interval
+/// is read from the config before each sleep, so a change takes effect after
+/// the current wait.
+pub void housekeeper(str config_path) {
+    while (true) {
+        int hours = 24;
+        match (HOARD_store.load(config_path)) {
+            case Ok(HOARD_store.Config config): {
+                hours = config.gc_hours;
+            }
+            case Err(_): {
+            }
+        }
+        if (hours <= 0) {
+            // Off: look again in an hour, in case it is turned on.
+            timer.sleep_ms(HOUR_MS);
+            continue;
+        }
+        timer.sleep_ms(hours * HOUR_MS);
+        match (collect(config_path)) {
+            case Ok(List<str> lines): {
+                for (str line in lines) {
+                    io.eprint("hoard: " + line + "\n");
+                }
+            }
+            case Err(str problem): {
+                io.eprint("hoard: gc: " + problem + "\n");
+            }
+        }
+    }
+}
+
+/// One pass over every configured repository: `git gc` where it is needed.
+/// One line per repository collected or failed; untouched ones say nothing.
+pub Result<List<str>, str> collect(str config_path) {
+    HOARD_store.Config config = HOARD_store.load(config_path)?;
+    Map<str, str> env = git_env();
+    List<str> lines = [];
+    for (str name in config.repos.keys()) {
+        str git_directory = HOARD_store.repo_git_directory(config, config_path, name);
+        if (!is_gc_needed(git_directory, env)) {
+            continue;
+        }
+        List<str> argv = ["git", "--git-dir", git_directory, "gc", "--quiet"];
+        match (proc.run(argv, env: Option<Map<str, str>>.Some(clone(env)), should_check: false, is_quiet: true)) {
+            case Ok(proc.Completed done): {
+                if (done.is_success()) {
+                    lines.push("gc: " + name + " packed");
+                } else {
+                    lines.push("gc: " + name + " failed: " + done.stderr.utf8().or("").trim());
+                }
+            }
+            case Err(proc.Error failure): {
+                lines.push("gc: " + name + " could not run git: " + failure.to_str());
+            }
+        }
+    }
+    return Result<List<str>, str>.Ok(lines);
+}
+
+// Whether the repository has loose objects or more than one pack, by `git
+// count-objects -v`. A repository git cannot read is left alone.
+bool is_gc_needed(str git_directory, Map<str, str> env) {
+    List<str> argv = ["git", "--git-dir", git_directory, "count-objects", "-v"];
+    match (proc.run(argv, env: Option<Map<str, str>>.Some(clone(env)), should_check: false, is_quiet: true)) {
+        case Ok(proc.Completed done): {
+            if (!done.is_success()) {
+                return false;
+            }
+            int loose = 0;
+            int packs = 0;
+            for (str line in done.stdout.utf8().or("").split("\n")) {
+                if (line.starts_with("count: ")) {
+                    loose = line.substr(7, line.size()).trim().parse_int().or(0);
+                } else if (line.starts_with("packs: ")) {
+                    packs = line.substr(7, line.size()).trim().parse_int().or(0);
+                }
+            }
+            return loose > 0 || packs > 1;
+        }
+        case Err(_): {
+            return false;
+        }
+    }
+}
+
+// The environment git runs in: PATH and HOME only, as for the pages.
+Map<str, str> git_env() {
+    Map<str, str> env = {"PATH": os.env("PATH").or("/usr/local/bin:/usr/bin:/bin"), "LC_ALL": "C"};
+    match (os.env("HOME")) {
+        case Some(str home): {
+            env.set("HOME", home);
+        }
+        case None: {
+        }
+    }
+    return env;
+}

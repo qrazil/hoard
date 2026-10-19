@@ -19,6 +19,7 @@
 import args;
 import core.HOARD_addr;
 import core.HOARD_crypt;
+import core.HOARD_gc;
 import core.HOARD_pages;
 import core.HOARD_server;
 import core.HOARD_store;
@@ -65,6 +66,7 @@ proxies.values("set", placeholder: "ENTRY", help: "replace the list with these I
 args.Parser regen = table.command("regen", "rebuild a repository's pages");
 regen.flag("hook", help: "called from post-receive: keep the pages that are already built");
 regen.positional("name", help: "the repository name");
+table.command("gc", "pack repositories with loose objects now (serve does this every gc_hours)");
 table.command("list", "show users and repositories", short: "l");
 table.completions();
 args.Parsed given = table.parse_or_exit(os.arguments().slice(1, os.arguments().size()), status: 64);
@@ -94,6 +96,12 @@ Result<void, str> dispatch(str path, args.Parsed command) {
     }
     if (word == "regen") {
         return cmd_regen(path, command);
+    }
+    if (word == "gc") {
+        for (str line in HOARD_gc.collect(path)?) {
+            print(line);
+        }
+        return Result<void, str>.Ok;
     }
     if (word == "list") {
         return cmd_list(path);

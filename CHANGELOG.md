@@ -16,3 +16,9 @@ First version: the m31 port of orogit.
 - Admin commands in Oro's args grammar, serialised by a `<config>.lock`
   directory; `-adopt` takes over an existing bare repository (an orogit move).
 - Reads orogit's config file unchanged.
+- Housekeeping: while serving, `git gc` runs every `gc_hours` hours (config,
+  default 24, 0 is off) on repositories with loose objects or several packs;
+  `-gc` runs a pass now.
+- `TCP_NODELAY` on every connection: no 40 ms Nagle stall per kept-alive
+  request.
+- SHA-512 comes from m31 0.7.0's `lib/crypto/sha512`.

@@ -19,6 +19,7 @@
 import core.HOARD_addr;
 import core.HOARD_auth;
 import core.HOARD_cgi;
+import core.HOARD_gc;
 import core.HOARD_html;
 import core.HOARD_store;
 import fs;
@@ -59,6 +60,7 @@ pub Result<void, str> serve(str config_path, str listen, int workers) {
         case Ok(net.Listener listener): {
             Chan<HOARD_auth.Ask> asks = Chan<HOARD_auth.Ask>(256);
             spawn guard_thread(asks);
+            spawn housekeeping_thread(clone(config_path));
             Chan<net.Conn> connections = Chan<net.Conn>(64);
             for (int index in 0 .. workers) {
                 spawn worker(connections, asks, clone(config_path));
@@ -79,6 +81,11 @@ pub Result<void, str> serve(str config_path, str listen, int workers) {
             return Result<void, str>.Err("could not listen on " + listen + ": " + failure.to_str());
         }
     }
+}
+
+// `spawn` takes a function of this module, so housekeeping is started through it.
+void housekeeping_thread(str config_path) {
+    HOARD_gc.housekeeper(config_path);
 }
 
 // `spawn` takes a function of this module, so the guard is started through it.
