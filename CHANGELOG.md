@@ -32,3 +32,7 @@ First version: the m31 port of orogit.
   constant memory, with the pages' access rules; strict tag names (no `/`,
   no leading `-`, no `..`) are checked before git runs. The summary page
   links each tag's tarball.
+- Per-user access tokens for scripts and CI: `-token USER NAME [--read-only]`
+  prints a `hoard_` token once, `-tokens` and `-revoke-token` manage them.
+  Only a SHA-256 is stored, under the user in the config; a token logs in
+  wherever the password does, never with more than the user's grants.

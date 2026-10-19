@@ -9,13 +9,16 @@
 //       "pages_root": "pages",
 //       "base_url": "https://git.example.org",
 //       "trusted_proxies": ["127.0.0.1"],
-//       "users": {"alice": {"hash": "$6$salt$..."}},
+//       "users": {"alice": {"hash": "$6$salt$...",
+//                           "tokens": {"ci": {"sha256": "...", "scope": "read", "created": "2026-10-18"}}}},
 //       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"]}},
 //       "gc_hours": 24
 //     }
 //
 // Relative paths are relative to the directory holding the config file. Keys
 // this program does not know (orogit's "oro") are kept and written back.
+// orogit reads only a user's "hash", so access tokens beside it (HOARD_token)
+// leave the file readable by orogit.
 
 import core.HOARD_addr;
 import encoding.json;
@@ -27,6 +30,16 @@ pub type Repo {
     pub bool is_public;
     pub List<str> readers;
     pub List<str> writers;
+}
+
+/// An access token as stored: never the token, only its SHA-256 (HOARD_token).
+pub type Token {
+    // 64 lowercase hex digits
+    pub str sha256;
+    // "read" tokens may not push even where their user may.
+    pub bool is_read_only;
+    // YYYY-MM-DD, UTC
+    pub str created;
 }
 
 pub type Config {
@@ -42,6 +55,8 @@ pub type Config {
     pub Map<str, json.Value> extra;
     // Hours between `git gc` passes while serving (HOARD_gc); 0 is off.
     pub int gc_hours = 24;
+    // user name -> token name -> token; only for users in `users`.
+    pub Map<str, Map<str, Token>> tokens = {};
 }
 
 pub Config default_config() {
@@ -93,6 +108,25 @@ pub bool is_valid_tag_name(str name) {
 /// Basic credential.
 pub bool is_valid_user_name(str name) {
     return is_simple_name(name, 64);
+}
+
+/// An access token's name: the same alphabet again.
+pub bool is_valid_token_name(str name) {
+    return is_simple_name(name, 64);
+}
+
+/// 64 lowercase hex digits: a SHA-256 as `render` writes it.
+pub bool is_sha256_hex(str text) {
+    if (text.size() != 64) {
+        return false;
+    }
+    for (int index in 0 .. text.size()) {
+        int byte = text.byte_at(index);
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // --- paths -------------------------------------------------------------------
@@ -253,9 +287,14 @@ pub Result<Config, str> parse(str text) {
         } else if (key == "users") {
             Map<str, json.Value> users = object_of(value).or({});
             for (str name in users.keys()) {
-                str hash = text_of(member(users.get(name).or(json.Value.Null), "hash"), "");
+                json.Value entry = users.get(name).or(json.Value.Null);
+                str hash = text_of(member(entry, "hash"), "");
                 if (is_valid_user_name(name) && hash != "") {
                     config.users.set(name, hash);
+                    Map<str, Token> tokens = tokens_of(member(entry, "tokens"));
+                    if (tokens.size() > 0) {
+                        config.tokens.set(name, tokens);
+                    }
                 }
             }
         } else if (key == "repos") {
@@ -272,6 +311,23 @@ pub Result<Config, str> parse(str text) {
         }
     }
     return Result<Config, str>.Ok(config);
+}
+
+// A user's well-formed tokens. One with a malformed digest or an unknown
+// scope is dropped: it could never match, or would match with a scope nobody
+// chose.
+Map<str, Token> tokens_of(json.Value value) {
+    Map<str, Token> out = {};
+    Map<str, json.Value> entries = object_of(value).or({});
+    for (str name in entries.keys()) {
+        json.Value entry = entries.get(name).or(json.Value.Null);
+        str digest = text_of(member(entry, "sha256"), "");
+        str scope = text_of(member(entry, "scope"), "");
+        if (is_valid_token_name(name) && is_sha256_hex(digest) && (scope == "read" || scope == "write")) {
+            out.set(name, Token(digest, scope == "read", text_of(member(entry, "created"), "")));
+        }
+    }
+    return out;
 }
 
 // --- reading JSON values -----------------------------------------------------
@@ -486,6 +542,25 @@ pub Result<str, str> render(Config config) {
     Map<str, json.Value> users = {};
     for (str name in config.users.keys()) {
         Map<str, json.Value> entry = {"hash": json.Value.Str(config.users.get(name).or(""))};
+        Map<str, json.Value> tokens = {};
+        Map<str, Token> owned = config.tokens.get(name).or({});
+        for (str label in owned.keys()) {
+            match (owned.get(label)) {
+                case Some(Token token): {
+                    str scope = "write";
+                    if (token.is_read_only) {
+                        scope = "read";
+                    }
+                    Map<str, json.Value> fields = {"sha256": json.Value.Str(token.sha256), "scope": json.Value.Str(scope), "created": json.Value.Str(token.created)};
+                    tokens.set(label, json.Value.Object(fields));
+                }
+                case None: {
+                }
+            }
+        }
+        if (tokens.size() > 0) {
+            entry.set("tokens", json.Value.Object(tokens));
+        }
         users.set(name, json.Value.Object(entry));
     }
     out.set("users", json.Value.Object(users));

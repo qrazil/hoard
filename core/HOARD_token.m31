@@ -1,0 +1,75 @@
+// Access tokens: what scripts and CI log in with instead of a password.
+//
+// A token is `hoard_` and 64 hex digits: 32 octets from `random.system()`,
+// which is the kernel's CSPRNG (getrandom(2), getentropy(3) elsewhere). It is
+// shown once, when it is made; the config keeps only its SHA-256.
+//
+// Why one SHA-256 and not SHA-512-crypt: crypt's salt and 5000 rounds are
+// there to slow down guesses at a password a person chose. A token is 256
+// bits from the kernel, a space no one can search however fast each guess
+// is, so stretching would cost every request 30 ms and buy nothing. A salt
+// buys nothing either: no two tokens are the same, and no table of
+// precomputed tokens can exist.
+//
+// The prefix makes a token recognisable: to a secret scanner that finds one
+// pasted somewhere, and to the server, which tells a token from a password by
+// its shape and checks it against the user's token digests only, never the
+// slow crypt hash.
+
+import core.HOARD_crypt;
+import core.HOARD_store;
+import crypto.sha256;
+import random;
+
+pub const str PREFIX = "hoard_";
+const int SECRET_OCTETS = 32;
+/// What a login for a user with no tokens (or no such user) is compared
+/// with, so that it does the same work as a wrong token. No token hashes to
+/// it, and a match with it finds no token anyway.
+const str DUMMY_DIGEST = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A new token. Shown to the admin once; only `digest(token)` is kept.
+pub str generate() {
+    return PREFIX + random.system().hex(SECRET_OCTETS);
+}
+
+/// Whether `password` has a token's shape: the prefix and 64 lowercase hex
+/// digits. Such a password is checked as a token and only as a token, so
+/// `-adduser` and `-passwd` refuse one.
+pub bool is_token_shaped(str password) {
+    if (!password.starts_with(PREFIX)) {
+        return false;
+    }
+    // The secret's 64 lowercase hex digits are exactly a SHA-256's shape.
+    return HOARD_store.is_sha256_hex(password.substr(PREFIX.size(), password.size()));
+}
+
+/// The stored form of `token`: its SHA-256 as 64 lowercase hex digits.
+pub str digest(str token) {
+    return sha256.hex(token.to_bytes());
+}
+
+/// The token among `tokens` that `token` is, or None. Every stored digest is
+/// compared in constant time, with no early exit, and a user with no tokens
+/// (or one who does not exist) is compared with a dummy, so the time taken
+/// says nothing about which token matched or whether the user exists.
+pub Option<HOARD_store.Token> find(Map<str, HOARD_store.Token> tokens, str token) {
+    bytes wanted = digest(token).to_bytes();
+    Option<HOARD_store.Token> found = Option<HOARD_store.Token>.None;
+    if (tokens.size() == 0) {
+        HOARD_crypt.is_ct_equal(wanted, DUMMY_DIGEST.to_bytes());
+        return found;
+    }
+    for (str name in tokens.keys()) {
+        match (tokens.get(name)) {
+            case Some(HOARD_store.Token stored): {
+                if (HOARD_crypt.is_ct_equal(wanted, stored.sha256.to_bytes())) {
+                    found = Option<HOARD_store.Token>.Some(stored);
+                }
+            }
+            case None: {
+            }
+        }
+    }
+    return found;
+}

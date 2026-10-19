@@ -25,6 +25,7 @@ import core.HOARD_cgi;
 import core.HOARD_gc;
 import core.HOARD_html;
 import core.HOARD_store;
+import core.HOARD_token;
 import fs;
 import io;
 import net;
@@ -229,7 +230,8 @@ http.Request placeholder_request() {
 /// Who is asking.
 enum Who {
     Anonymous;
-    User(str);
+    /// A user, and whether they logged in with a read-only token.
+    User(str, bool);
     /// 401 (bad credentials) or 429 (locked out, retry after N seconds).
     Denied(int, int);
 }
@@ -276,11 +278,13 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
         }
     }
     str user = "";
+    bool is_read_only = false;
     match (identify(config, request, guard, address)) {
         case Anonymous: {
         }
-        case User(str name): {
+        case User(str name, bool is_token_read_only): {
             user = name;
+            is_read_only = is_token_read_only;
         }
         case Denied(int status, int retry): {
             return deny(connection, incoming, status, retry);
@@ -288,7 +292,9 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
     }
     bool is_allowed = HOARD_store.can_read(config, repo, user);
     if (need == HOARD_cgi.WRITE) {
-        is_allowed = HOARD_store.can_write(config, repo, user);
+        // A read-only token is its user with the writes taken away, so a
+        // push with one is refused exactly as a reader's is.
+        is_allowed = HOARD_store.can_write(config, repo, user) && !is_read_only;
     }
     if (!is_allowed) {
         if (user == "") {
@@ -321,8 +327,9 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
 }
 
 // An anonymous identity when there is no Authorization header, a user when it
-// holds a valid login, and a denial otherwise. A wrong password is never
-// downgraded to anonymous access.
+// holds a valid login (a password, or an access token), and a denial
+// otherwise. A wrong password or token is never downgraded to anonymous
+// access.
 Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard guard, str address) {
     match (request.header("authorization")) {
         case None: {
@@ -335,11 +342,30 @@ Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard g
             }
             match (HOARD_auth.parse_basic(header)) {
                 case Some(HOARD_auth.Credentials credentials): {
+                    if (HOARD_token.is_token_shaped(credentials.password)) {
+                        // An access token: one SHA-256 against the user's
+                        // token digests, never the 30 ms crypt verify. A user
+                        // that does not exist is compared with a dummy
+                        // digest, the same work as a wrong token.
+                        Map<str, HOARD_store.Token> tokens = config.tokens.get(credentials.user).or({});
+                        match (HOARD_token.find(tokens, credentials.password)) {
+                            case Some(HOARD_store.Token token): {
+                                if (config.users.contains(credentials.user)) {
+                                    guard.succeeded(address);
+                                    return Who.User(credentials.user, token.is_read_only);
+                                }
+                            }
+                            case None: {
+                            }
+                        }
+                        guard.failed(address);
+                        return Who.Denied(401, 0);
+                    }
                     match (config.users.get(credentials.user)) {
                         case Some(str hash): {
                             if (guard.is_password_correct(credentials.user, hash, credentials.password)) {
                                 guard.succeeded(address);
-                                return Who.User(credentials.user);
+                                return Who.User(credentials.user, false);
                             }
                         }
                         case None: {
@@ -412,7 +438,7 @@ HOARD_cgi.Next index_page(net.Conn connection, http.RequestStream incoming, HOAR
     match (identify(config, request, guard, address)) {
         case Anonymous: {
         }
-        case User(str name): {
+        case User(str name, _): {
             user = name;
         }
         case Denied(int status, int retry): {

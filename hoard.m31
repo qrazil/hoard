@@ -23,6 +23,7 @@ import core.HOARD_gc;
 import core.HOARD_pages;
 import core.HOARD_server;
 import core.HOARD_store;
+import core.HOARD_token;
 import date;
 import fs;
 import io;
@@ -47,6 +48,15 @@ args.Parser passwd = table.command("passwd", "change a password; read from stdin
 passwd.positional("name", help: "the user name");
 args.Parser deluser = table.command("deluser", "remove a user and all their grants");
 deluser.positional("name", help: "the user name");
+args.Parser token = table.command("token", "make an access token for a user and print it, once");
+token.flag("read-only", help: "the token may read but never push");
+token.positional("user", help: "the user it logs in as");
+token.positional("name", help: "a name for the token, e.g. ci");
+args.Parser tokens = table.command("tokens", "list a user's access tokens (never the tokens themselves)");
+tokens.positional("user", help: "the user");
+args.Parser revoke_token = table.command("revoke-token", "delete a user's access token");
+revoke_token.positional("user", help: "the user");
+revoke_token.positional("name", help: "the token's name");
 args.Parser addrepo = table.command("addrepo", "create a bare repository");
 addrepo.flag("public", help: "anonymous users may read it");
 addrepo.positional("name", help: "the repository name");
@@ -122,6 +132,9 @@ Result<void, str> dispatch(str path, args.Parsed command) {
     if (word == "list") {
         return cmd_list(path);
     }
+    if (word == "tokens") {
+        return cmd_tokens(path, command.positional("user"));
+    }
     if (word == "proxies" && !command.is_given("set")) {
         HOARD_store.Config config = HOARD_store.load(path)?;
         for (str entry in config.trusted_proxies) {
@@ -168,12 +181,31 @@ Result<void, str> change(str path, args.Parsed command) {
             return Result<void, str>.Err("no user '" + name + "'");
         }
         config.users.remove(name);
+        config.tokens.remove(name);
         for (str repo in config.repos.keys()) {
             HOARD_store.Repo entry = repo_of(config, repo)?;
             drop_user(entry, name);
         }
         HOARD_store.save(path, config)?;
         print("deleted user " + name);
+        return Result<void, str>.Ok;
+    }
+    if (word == "token") {
+        return add_token(path, config, command.positional("user"), command.positional("name"), command.is_flag_set("read-only"));
+    }
+    if (word == "revoke-token") {
+        str user = command.positional("user");
+        str name = command.positional("name");
+        Map<str, HOARD_store.Token> owned = config.tokens.get(user).or({});
+        if (!owned.contains(name)) {
+            return Result<void, str>.Err("user '" + user + "' has no token '" + name + "'");
+        }
+        owned.remove(name);
+        if (owned.size() == 0) {
+            config.tokens.remove(user);
+        }
+        HOARD_store.save(path, config)?;
+        print("revoked token " + name + " of " + user);
         return Result<void, str>.Ok;
     }
     if (word == "addrepo" || word == "adopt") {
@@ -285,12 +317,65 @@ Result<str, str> read_password() {
             if (problem != "") {
                 return Result<str, str>.Err(problem);
             }
+            // A password of a token's shape would only ever be checked as a
+            // token (HOARD_server.identify), so it could never log in.
+            if (HOARD_token.is_token_shaped(line)) {
+                return Result<str, str>.Err("a password may not have the form of an access token");
+            }
             return Result<str, str>.Ok(line);
         }
         case Err(io.Error failure): {
             return Result<str, str>.Err("could not read the password: " + failure.to_str());
         }
     }
+}
+
+// --- access tokens -----------------------------------------------------------
+
+/// Make a token, save its digest, and print the token: on stdout, once, and
+/// nowhere else. It is printed only after the save, so a token that is shown
+/// always works.
+Result<void, str> add_token(str path, HOARD_store.Config config, str user, str name, bool is_read_only) {
+    if (!config.users.contains(user)) {
+        return Result<void, str>.Err("no user '" + user + "'");
+    }
+    if (!HOARD_store.is_valid_token_name(name)) {
+        return Result<void, str>.Err("invalid token name '" + name + "' (letters, digits, '.', '_', '-')");
+    }
+    Map<str, HOARD_store.Token> owned = config.tokens.get(user).or({});
+    if (owned.contains(name)) {
+        return Result<void, str>.Err("user '" + user + "' already has a token '" + name + "'; revoke it first");
+    }
+    str secret = HOARD_token.generate();
+    owned.set(name, HOARD_store.Token(HOARD_token.digest(secret), is_read_only, date.iso(date.now()).substr(0, 10)));
+    config.tokens.set(user, owned);
+    HOARD_store.save(path, config)?;
+    print(secret);
+    return Result<void, str>.Ok;
+}
+
+Result<void, str> cmd_tokens(str path, str user) {
+    HOARD_store.Config config = HOARD_store.load(path)?;
+    if (!config.users.contains(user)) {
+        return Result<void, str>.Err("no user '" + user + "'");
+    }
+    Map<str, HOARD_store.Token> owned = config.tokens.get(user).or({});
+    List<str> names = owned.keys();
+    names.sort();
+    for (str name in names) {
+        match (owned.get(name)) {
+            case Some(HOARD_store.Token entry): {
+                str scope = "write";
+                if (entry.is_read_only) {
+                    scope = "read";
+                }
+                print(name + " " + scope + " " + entry.created);
+            }
+            case None: {
+            }
+        }
+    }
+    return Result<void, str>.Ok;
 }
 
 // --- init and serve ----------------------------------------------------------

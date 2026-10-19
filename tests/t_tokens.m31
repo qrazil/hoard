@@ -1,0 +1,148 @@
+// Unit tests for HOARD_token and the tokens in HOARD_store's config.
+//
+// The digest vector was made with Python's hashlib.sha256.
+//
+// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+
+import core.HOARD_store;
+import core.HOARD_token;
+
+type Tally {
+    int passed = 0;
+    int failed = 0;
+}
+
+void Tally.same(str name, str got, str want) {
+    if (got == want) {
+        passed = passed + 1;
+        print("ok   " + name);
+    } else {
+        failed = failed + 1;
+        print("FAIL " + name + ": got [" + got + "] want [" + want + "]");
+    }
+}
+
+void Tally.check(str name, bool is_actual, bool is_expected) {
+    same(name, is_actual.to_str(), is_expected.to_str());
+}
+
+Tally tally = Tally();
+
+const str ZEROS = "hoard_0000000000000000000000000000000000000000000000000000000000000000";
+const str ZEROS_DIGEST = "45057307aec5e247c8f8aa6f93b3725c6707411b01a8625d6395434f39f964be";
+
+// --- generate --------------------------------------------------------------------
+
+str made = HOARD_token.generate();
+str again = HOARD_token.generate();
+tally.check("generate: starts with hoard_", made.starts_with("hoard_"), true);
+tally.same("generate: prefix + 64 hex digits", made.size().to_str(), "70");
+tally.check("generate: has a token's shape", HOARD_token.is_token_shaped(made), true);
+tally.check("generate: two tokens differ", made != again, true);
+tally.check("generate: the secret is not all one digit", made.substr(6, 70) != made.substr(6, 7).repeat(64), true);
+
+// --- shape -----------------------------------------------------------------------
+
+tally.check("shape: all zeros", HOARD_token.is_token_shaped(ZEROS), true);
+tally.check("shape: no prefix", HOARD_token.is_token_shaped("0".repeat(64)), false);
+tally.check("shape: another prefix", HOARD_token.is_token_shaped("hoarx_" + "0".repeat(64)), false);
+tally.check("shape: one digit short", HOARD_token.is_token_shaped("hoard_" + "0".repeat(63)), false);
+tally.check("shape: one digit long", HOARD_token.is_token_shaped("hoard_" + "0".repeat(65)), false);
+tally.check("shape: upper-case hex", HOARD_token.is_token_shaped("hoard_" + "A".repeat(64)), false);
+tally.check("shape: not hex", HOARD_token.is_token_shaped("hoard_" + "g".repeat(64)), false);
+tally.check("shape: a password", HOARD_token.is_token_shaped("hoard_password"), false);
+
+// --- digest and find -------------------------------------------------------------
+
+tally.same("digest: SHA-256 of the whole token, hex", HOARD_token.digest(ZEROS), ZEROS_DIGEST);
+tally.check("digest: stored form is well formed", HOARD_store.is_sha256_hex(HOARD_token.digest(made)), true);
+Map<str, HOARD_store.Token> owned = {};
+owned.set("ci", HOARD_store.Token(HOARD_token.digest(made), true, "2026-10-18"));
+owned.set("deploy", HOARD_store.Token(ZEROS_DIGEST, false, "2026-10-18"));
+match (HOARD_token.find(owned, made)) {
+    case Some(HOARD_store.Token found): {
+        tally.check("find: a read-only token is found as read-only", found.is_read_only, true);
+    }
+    case None: {
+        tally.check("find: a read-only token is found", false, true);
+    }
+}
+match (HOARD_token.find(owned, ZEROS)) {
+    case Some(HOARD_store.Token found): {
+        tally.check("find: a write token is found as write", found.is_read_only, false);
+    }
+    case None: {
+        tally.check("find: a write token is found", false, true);
+    }
+}
+tally.check("find: another token is not", HOARD_token.find(owned, again).is_some(), false);
+tally.check("find: the digest itself is not a token", HOARD_token.find(owned, ZEROS_DIGEST).is_some(), false);
+Map<str, HOARD_store.Token> none = {};
+tally.check("find: a user without tokens has none", HOARD_token.find(none, ZEROS).is_some(), false);
+
+// --- the config ------------------------------------------------------------------
+
+// One user with two good tokens and three malformed ones, one with none, and
+// tokens under an entry with no hash (not a user).
+str digest_field = "{\"sha256\": \"" + ZEROS_DIGEST + "\", ";
+List<str> alice_tokens = [];
+alice_tokens.push("\"ci\": " + digest_field + "\"scope\": \"read\", \"created\": \"2026-10-18\"}");
+alice_tokens.push("\"push\": " + digest_field + "\"scope\": \"write\", \"created\": \"2026-10-17\"}");
+alice_tokens.push("\"badscope\": " + digest_field + "\"scope\": \"admin\"}");
+alice_tokens.push("\"baddigest\": {\"sha256\": \"" + ZEROS_DIGEST.to_upper() + "\", \"scope\": \"read\"}");
+alice_tokens.push("\"bad name\": " + digest_field + "\"scope\": \"read\"}");
+List<str> users = [];
+users.push("\"alice\": {\"hash\": \"$6$s$h\", \"tokens\": {" + alice_tokens.join(", ") + "}}");
+users.push("\"bob\": {\"hash\": \"$6$t$i\"}");
+users.push("\"nohash\": {\"tokens\": {\"ci\": " + digest_field + "\"scope\": \"write\"}}}");
+str text = "{\"users\": {" + users.join(", ") + "}}";
+match (HOARD_store.parse(text)) {
+    case Ok(HOARD_store.Config config): {
+        Map<str, HOARD_store.Token> alice = config.tokens.get("alice").or({});
+        List<str> names = alice.keys();
+        names.sort();
+        tally.same("parse: well-formed tokens kept, malformed dropped", names.join(","), "ci,push");
+        match (alice.get("ci")) {
+            case Some(HOARD_store.Token token): {
+                tally.check("parse: scope read is read-only", token.is_read_only, true);
+                tally.same("parse: created", token.created, "2026-10-18");
+                tally.same("parse: digest", token.sha256, ZEROS_DIGEST);
+            }
+            case None: {
+                tally.check("parse: ci", false, true);
+            }
+        }
+        tally.check("parse: scope write may push", alice.get("push").is_some() && !alice.get("push").or(HOARD_store.Token("", true, "")).is_read_only, true);
+        tally.check("parse: a user with no tokens has no entry", config.tokens.contains("bob"), false);
+        tally.check("parse: no tokens without a user", config.tokens.contains("nohash") || config.users.contains("nohash"), false);
+        match (HOARD_store.render(config)) {
+            case Ok(str first): {
+                tally.check("render: tokens written under the user", first.contains("\"tokens\""), true);
+                tally.check("render: the hash stays where orogit reads it", first.contains("\"hash\": \"$6$s$h\""), true);
+                tally.same("render: a user without tokens has no tokens key", first.split("\"tokens\"").size().to_str(), "2");
+                match (HOARD_store.parse(first)) {
+                    case Ok(HOARD_store.Config reread): {
+                        match (HOARD_store.render(reread)) {
+                            case Ok(str second): {
+                                tally.same("round trip: parse(render(c)) renders the same", second, first);
+                            }
+                            case Err(str problem): {
+                                tally.same("round trip: render", problem, "");
+                            }
+                        }
+                    }
+                    case Err(str problem): {
+                        tally.same("round trip: parse", problem, "");
+                    }
+                }
+            }
+            case Err(str problem): {
+                tally.same("render", problem, "");
+            }
+        }
+    }
+    case Err(str problem): {
+        tally.same("parse", problem, "");
+    }
+}
+print(tally.passed.to_str() + " passed, " + tally.failed.to_str() + " failed");
