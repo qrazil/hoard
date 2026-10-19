@@ -921,6 +921,140 @@ hc -visibility priv secret
 [ "$RC" = 1 ]
 check "visibility refuses a level that is not public or private" $? "rc $RC: $(err1)"
 
+# --- hoard: -delrepo and -rename ------------------------------------------------------------
+
+section "9e. delrepo keeps the repository in repos/.trash; rename carries everything over"
+TRASH="$SRV/repos/.trash"
+hc -addrepo doomed --public -grant doomed alice write
+DW="$WORK/doomed"
+git init -q -b main "$DW"
+DSHA=$(commit_file "$DW" a.txt "doomed
+" "before deletion")
+g -C "$DW" push "$(aurl "$ALICE" /doomed.git)" main
+mkdir -p "$T/outside"
+printf 'keep\n' >"$T/outside/keep"
+ln -s "$T/outside" "$SRV/pages/doomed/escape"
+cp "$CFG" "$T/cfg.before"
+hc -delrepo doomed
+[ "$RC" = 64 ] && grep -q "would:" "$T/cli.err" && grep -q "add --yes" "$T/cli.err" && cmp -s "$CFG" "$T/cfg.before" \
+    && [ -d "$(bare doomed)" ] && [ -f "$SRV/pages/doomed/index.html" ] && [ ! -e "$TRASH" ]
+check "delrepo without --yes shows the plan and changes nothing (exit 64)" $? "rc $RC: $(err1)"
+hc -addrepo never4 -delrepo doomed
+[ "$RC" = 64 ] && [ ! -e "$(bare never4)" ]
+check "...and refuses the whole line before any of it runs" $? "rc $RC: $(err1)"
+hc -delrepo doomed --yes
+TR=$(ls -d "$TRASH"/doomed-*.git 2>/dev/null | head -n 1)
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.doomed)" = null ] && [ ! -e "$(bare doomed)" ] && [ -n "$TR" ] \
+    && grep -F -q "$TR" "$T/cli.out" && grep -q "restore:" "$T/cli.out" && grep -q "purge:" "$T/cli.out"
+check "delrepo --yes drops the config entry and moves the repository to repos/.trash" $? "rc $RC: $(err1)"
+git --git-dir "$TR" fsck --no-progress >/dev/null 2>&1 && g clone -q "$TR" "$WORK/fromtrash" && [ "$(git -C "$WORK/fromtrash" rev-parse HEAD)" = "$DSHA" ]
+check "the trashed repository is intact: fsck passes and it clones" $? "$(gerr)"
+[ ! -e "$SRV/pages/doomed" ] && [ -f "$T/outside/keep" ]
+check "its pages are deleted, without following a symlink out of them" $?
+get "/doomed.git/info/refs?service=git-upload-pack" -u "$ALICE"
+s1=$ST
+get /doomed/ -u "$ALICE"
+s2=$ST
+[ "$s1" = 404 ] && [ "$s2" = 404 ]
+check "a deleted repository is 404 for git and for pages" $? "git $s1, pages $s2"
+get / -u "$ALICE"
+[ "$ST" = 200 ] && ! body_has doomed && ! body_has .trash
+check "the index lists neither the deleted repository nor the trash" $? "status $ST"
+get "/.trash/" -u "$ALICE"
+s1=$ST
+get "/.trash/$(basename "$TR")/info/refs?service=git-upload-pack" -u "$ALICE"
+[ "$s1" = 404 ] && [ "$ST" = 404 ]
+check "the trash is never served" $? "pages $s1, git $ST"
+hc -addrepo doomed
+[ "$RC" = 0 ] && [ -z "$(refs_of doomed)" ] && [ -d "$TR" ]
+check "the name can be used again, and the trashed copy stays" $? "rc $RC: $(err1)"
+hc -delrepo doomed --yes
+[ "$RC" = 0 ] && [ "$(ls -d "$TRASH"/doomed-*.git | wc -l | tr -d ' ')" = 2 ]
+check "a second delete of the name keeps both copies apart" $? "rc $RC: $(err1)"
+hc -delrepo nosuch --yes
+[ "$RC" = 1 ] && grep -q "no repository" "$T/cli.err"
+check "delrepo of an unknown repository fails (exit 1)" $? "rc $RC: $(err1)"
+hc -delrepo .trash --yes
+[ "$RC" = 64 ] && [ -d "$TRASH" ]
+check ".trash is not a repository name (exit 64)" $? "rc $RC: $(err1)"
+hc -addrepo linked
+rm -rf "$SRV/pages/linked"
+mkdir -p "$T/outside2"
+printf 'keep\n' >"$T/outside2/keep"
+ln -s "$T/outside2" "$SRV/pages/linked"
+hc -delrepo linked --yes
+[ "$RC" = 1 ] && grep -q "symlink" "$T/cli.err" && [ -f "$T/outside2/keep" ] && [ "$(py config_get "$CFG" repos.linked)" = null ]
+check "a pages directory that is a symlink is left alone and reported (exit 1)" $? "rc $RC: $(err1)"
+rm -f "$SRV/pages/linked"
+
+hc -addrepo moving -grant moving alice write -grant moving bob read
+MW="$WORK/moving"
+git init -q -b main "$MW"
+MSHA=$(commit_file "$MW" m.txt "moving
+" "before the rename")
+g -C "$MW" push "$(aurl "$ALICE" /moving.git)" main
+hc -rename moving moved
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.moving)" = null ] && [ ! -e "$(bare moving)" ] && [ -d "$(bare moved)" ] \
+    && [ "$(git --git-dir "$(bare moved)" config hoard.repo)" = moved ]
+check "rename moves the repository and its hoard.repo" $? "rc $RC: $(err1)"
+[ "$(py config_get "$CFG" repos.moved.writers)" = '["alice"]' ] && [ "$(py config_get "$CFG" repos.moved.readers)" = '["bob"]' ] \
+    && [ "$(py config_get "$CFG" repos.moved.public)" = false ]
+check "rename carries the permissions over" $? "$(py config_get "$CFG" repos.moved)"
+g clone -q "$(aurl "$ALICE" /moved.git)" "$WORK/moved-clone" && [ "$(git -C "$WORK/moved-clone" rev-parse HEAD)" = "$MSHA" ]
+check "a clone through the new URL works" $? "$(gerr)"
+get "/moving.git/info/refs?service=git-upload-pack" -u "$ALICE"
+s1=$ST
+get /moving/ -u "$ALICE"
+[ "$s1" = 404 ] && [ "$ST" = 404 ] && [ ! -e "$SRV/pages/moving" ]
+check "the old name is 404 and its pages are gone" $? "git $s1, pages $ST"
+get /moved/ -u "$ALICE"
+[ "$ST" = 200 ] && body_has "/moved.git" && ! body_has moving.git
+check "the pages are rebuilt under the new name" $? "status $ST"
+MSHA2=$(commit_file "$MW" n.txt "renamed
+" "after the rename")
+g -C "$MW" push "$(aurl "$ALICE" /moved.git)" main
+rc=$?
+get /moved/log.html -u "$ALICE"
+[ "$rc" = 0 ] && body_has "$MSHA2"
+check "a push to the renamed repository rebuilds its pages (the hook follows)" $? "$(glast)"
+hc -rename moved pub
+[ "$RC" = 1 ] && grep -q "already exists" "$T/cli.err" && [ -d "$(bare moved)" ]
+check "rename onto a configured name is refused" $? "rc $RC: $(err1)"
+git init -q --bare "$(bare stray)"
+hc -rename moved stray
+[ "$RC" = 1 ] && grep -q "already exists on disk" "$T/cli.err" && [ -d "$(bare moved)" ]
+check "rename onto a directory already on disk is refused" $? "rc $RC: $(err1)"
+rm -rf "$(bare stray)"
+bad=0
+for name in x.git a..b .hidden 'sp ace' ""; do
+    hc -rename moved "$name"
+    [ "$RC" = 64 ] || bad=1
+done
+[ "$bad" = 0 ] && [ -d "$(bare moved)" ]
+check "rename refuses invalid names (exit 64)" $?
+hc -rename nosuch other
+[ "$RC" = 1 ] && grep -q "no repository" "$T/cli.err"
+check "rename of an unknown repository fails (exit 1)" $? "rc $RC: $(err1)"
+mkdir "$CFG.lock"
+hc -rename moved locked
+[ "$RC" = 1 ] && grep -q rmdir "$T/cli.err" && [ -d "$(bare moved)" ] && [ ! -e "$(bare locked)" ]
+check "rename respects the admin lock" $? "rc $RC: $(err1)"
+hc -delrepo moved --yes
+[ "$RC" = 1 ] && [ -d "$(bare moved)" ]
+check "delrepo respects the admin lock" $? "rc $RC: $(err1)"
+rmdir "$CFG.lock"
+# A rename that died after moving the directory: running it again finishes.
+mv "$(bare moved)" "$(bare resumed)"
+hc -rename moved resumed
+[ "$RC" = 0 ] && [ "$(py config_get "$CFG" repos.resumed.writers)" = '["alice"]' ] && [ "$(git --git-dir "$(bare resumed)" config hoard.repo)" = resumed ]
+check "a rename interrupted after the move finishes when run again" $? "rc $RC: $(err1)"
+hc -rename adopted adopted2
+g clone -q "$(url /adopted2.git)" "$WORK/adopted2" && [ -f "$WORK/adopted2/more.txt" ]
+check "an adopted repository can be renamed" $? "rc $RC: $(err1) $(gerr)"
+hc -delrepo adopted2 --yes
+[ "$RC" = 0 ] && [ -n "$(ls -d "$TRASH"/adopted2-*.git 2>/dev/null)" ] && [ "$(py config_get "$CFG" repos.adopted2)" = null ]
+check "an adopted repository can be deleted" $? "rc $RC: $(err1)"
+
 # --- 10-11: damping and password changes --------------------------------------------------
 
 section "10. repeated wrong passwords are damped"

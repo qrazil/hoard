@@ -16,6 +16,9 @@ First version: the m31 port of orogit.
 - Admin commands in Oro's args grammar, serialised by a `<config>.lock`
   directory; `-adopt` takes over an existing bare repository (an orogit move).
 - Reads orogit's config file unchanged.
+- `-delrepo NAME --yes` moves a repository to `repos/.trash/` (never destroys
+  it) and deletes its pages; `-rename OLD NEW` renames one with its
+  permissions. Both can be finished by running them again after a crash.
 - Housekeeping: while serving, `git gc` runs every `gc_hours` hours (config,
   default 24, 0 is off) on repositories with loose objects or several packs;
   `-gc` runs a pass now.
