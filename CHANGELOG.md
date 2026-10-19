@@ -28,3 +28,7 @@ First version: the m31 port of orogit.
 - `install.sh --source URL [--sha256 HASH]` builds from a source tarball (for
   example a hoard server's own tag tarball) with the m31 release named in
   `M31_VERSION` and the system C compiler. CI reads the same file.
+- Tag tarballs: `/<repo>/archive/<tag>.tar.gz` streams `git archive` in
+  constant memory, with the pages' access rules; strict tag names (no `/`,
+  no leading `-`, no `..`) are checked before git runs. The summary page
+  links each tag's tarball.

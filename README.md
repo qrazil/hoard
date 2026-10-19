@@ -8,8 +8,14 @@ file and URL layout.
 ```
 /                     the repositories you may read (/?login to sign in)
 /<repo>.git/...       git smart HTTP: clone, fetch, push
+/<repo>/archive/<tag>.tar.gz
+                      a tag's source tarball, linked from the summary page
 /<repo>/...           the repository's generated pages
 ```
+
+Tarballs are served for tags only, with names of letters, digits, `.`, `_`
+and `-` (no `/`); readers of a private repository need to log in, as for its
+pages.
 
 ## Install
 
@@ -81,6 +87,7 @@ core/HOARD_crypt.m31   SHA-512-crypt
 core/HOARD_auth.m31    Basic credentials; the guard thread (cache, damping)
 core/HOARD_server.m31  accept loop, workers, routing, index, page serving
 core/HOARD_cgi.m31     git http-backend, streamed
+core/HOARD_archive.m31 tag tarballs (git archive), streamed
 core/HOARD_pages.m31   the page generator
 core/HOARD_html.m31    escaping and page layout
 tests/                 test.sh runs everything

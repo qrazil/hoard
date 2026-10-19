@@ -81,6 +81,14 @@ pub bool is_valid_repo_name(str name) {
     return is_simple_name(name, 100) && !name.contains("..") && !name.ends_with(".git");
 }
 
+/// A tag that gets a source tarball (HOARD_archive): the repository-name
+/// alphabet, so one path segment with no `/`, no leading `-` and nothing git
+/// reads as revision syntax (`^`, `~`, `:`, `@{`); and no `..`. Tags outside
+/// it are still listed, without a download.
+pub bool is_valid_tag_name(str name) {
+    return is_simple_name(name, 100) && !name.contains("..");
+}
+
 /// The same alphabet; in particular no `:`, the separator inside an HTTP
 /// Basic credential.
 pub bool is_valid_user_name(str name) {

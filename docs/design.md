@@ -18,12 +18,15 @@ The same feature set as orogit, nothing more in 0.1:
 | Pages | stagit-style static pages per repository, rebuilt by a post-receive hook: summary, log, files, one page per file and per commit. |
 | Index | `/` lists the repositories the requester may read; `/?login` asks for credentials. |
 | Admin | One CLI, Oro's args grammar: `-init`, `-serve`, `-adduser`, `-passwd`, `-deluser`, `-addrepo [--public]`, `-adopt`, `-delrepo --yes`, `-rename`, `-grant`, `-revoke`, `-visibility`, `-proxies [--set ...]`, `-regen [--hook]`, `-list`. |
+| Tarballs | `/<repo>/archive/<tag>.tar.gz`: a tag's source, made by `git archive` and streamed. Tags only. Not in orogit. |
 
 URL layout (unchanged from orogit):
 
 ```
 /                     repositories the requester may read
 /<repo>.git/...       git smart HTTP
+/<repo>/archive/<tag>.tar.gz
+                      a tag's source tarball (hoard only)
 /<repo>/...           the repository's generated pages
 ```
 
@@ -64,6 +67,7 @@ core/HOARD_crypt.m31     SHA-512-crypt hash and verify, constant-time compare
 core/HOARD_auth.m31      Basic credentials, the guard thread (cache and damping)
 core/HOARD_server.m31    accept loop, worker pool, request loop, routing, index, pages
 core/HOARD_cgi.m31       git http-backend as streamed CGI
+core/HOARD_archive.m31   tag tarballs: git archive, streamed
 core/HOARD_pages.m31     the page generator
 core/HOARD_html.m31      escaping and the page layout
 tests/                   unit tests (t_*.m31) and the end-to-end suite
@@ -102,6 +106,7 @@ loop:
   read_request_stream(conn)         head checked as read_request checks it
   route + authorise                 no body read yet
   git path   → cgi.run(...)         body piped to the backend, output streamed back
+  archive    → git archive streamed back
   pages path → file streamed back   start_response + BodyWriter
   index      → buffered page
   keep-alive only if the request body was read to the end
@@ -147,10 +152,47 @@ are written as regular files, and stale ones are removed.
 Two pushes close together each re-render until the branch tip they rendered
 is still the tip afterwards, so the last one to finish shows the newest commit.
 
+The summary's tag table links each tag's tarball (3.5). A tag whose name
+the server would refuse is listed without a link.
+
 Later (not 0.1): read objects through the m31git library instead of `git`
 subprocesses.
 
-### 3.5 Security rules carried over unchanged
+### 3.5 Tag tarballs
+
+`GET` or `HEAD /<repo>/archive/<tag>.tar.gz` answers a tag's source as
+`git archive --format=tar.gz --prefix=<repo>-<tag>/`.
+
+- Tags only, never branches or commit names, so a URL keeps meaning the same
+  bytes and can be cached.
+- The access rules are the pages' rules: anonymous on a private repository is
+  401, a user without read access is 404, never 403.
+- The tag name must be one path segment in the repository-name alphabet:
+  letters, digits, `.`, `_` and `-`, starting with a letter, digit or `_`, at
+  most 100 bytes, no `..`. That rules out a leading `-` (an option to git),
+  `/` and everything git reads as revision syntax (`^`, `~`, `:`, `@{`).
+  Tags with a `/` (`release/1.0`) are deliberately not served: one segment
+  keeps the check simple. A refused name is a 404 and never reaches git.
+- The name is then resolved once with `git rev-parse --verify --quiet
+  refs/tags/<tag>^{commit}`; a missing tag, or one that names no commit, is
+  the same 404. The archive is made from the commit found, so a tag moved
+  mid-request cannot mix two trees.
+- git runs with only `PATH`, `LC_ALL=C` and `GIT_CONFIG_NOSYSTEM=1`, so no
+  user's config can swap the compressor. Its stdout is copied to the client
+  in 64 KiB pieces (a 100 MB tarball peaks at about 9 MB resident). The first
+  piece is read before the head goes out, so a git that fails at once is a
+  clean 500. A client that disconnects drops the `Proc`, which kills git; a
+  git that fails mid-stream closes the connection without ending the chunked
+  body, so the client sees a truncated download, not a short valid one.
+- Headers: `Content-Type: application/gzip`, `Content-Disposition:
+  attachment; filename="<repo>-<tag>.tar.gz"`, `nosniff`. Public
+  repositories add `Cache-Control: public, max-age=86400, immutable` (a day,
+  because a tag can be moved by force); private ones `private, no-store`.
+  A `HEAD` gets the headers without running `git archive`.
+- `archive/` is routed before the pages and the generator never writes
+  there, so no generated page can shadow a tarball or the reverse.
+
+### 3.6 Security rules carried over unchanged
 
 - Path checks run after percent-decoding; `..`, `.`, NUL and backslash are
   refused before any lookup.
@@ -215,6 +257,9 @@ URL.
   private, refused pushes, a 100 MB push with RSS measured, concurrent clones
   during it, page regeneration, HTML injection, path attacks, damping, the
   proxy-chain client address, atomic config save, and the admin lock.
+  hoard adds tag tarballs: contents against a local `git archive`, access,
+  HEAD, hostile tag names (a logging `git` wrapper shows none reaches git), a
+  100 MB tarball with RSS measured, and a client hanging up mid-download.
 - Everything runs through `tests/test.sh`, on Linux and macOS, in CI.
 
 ## 5. Release and install

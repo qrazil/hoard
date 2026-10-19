@@ -2,8 +2,9 @@
 //
 // For one repository it writes, under its pages directory:
 //
-//     index.html                 summary: clone path, branches, tags, recent
-//                                commits, and the README as escaped text
+//     index.html                 summary: clone path, branches, tags (each
+//                                with its tarball link), recent commits, and
+//                                the README as escaped text
 //     log.html                   the latest LOG_LIMIT commits
 //     files.html                 every file of the default branch
 //     file/<dir>.d/<name>.html   one page per file
@@ -27,6 +28,7 @@
 // leave empty.
 
 import core.HOARD_html;
+import core.HOARD_store;
 import date;
 import fs;
 import io;
@@ -751,7 +753,13 @@ str summary_page(Git git, str repo, str base_url, str branch, List<Commit> commi
                 if (short.size() > 12) {
                     short = short.substr(0, 12);
                 }
-                rows.push("<tr><td class=\"mono\">" + esc(found.name) + "</td><td class=\"mono\">" + esc(short) + "</td></tr>");
+                // A tag with a name the server will take gets its tarball
+                // (HOARD_archive), linked relative to this page.
+                str download = "";
+                if (found.prefix == "refs/tags/" && HOARD_store.is_valid_tag_name(found.name)) {
+                    download = "<td><a href=\"archive/" + esc(found.name) + ".tar.gz\">" + esc(repo) + "-" + esc(found.name) + ".tar.gz</a></td>";
+                }
+                rows.push("<tr><td class=\"mono\">" + esc(found.name) + "</td><td class=\"mono\">" + esc(short) + "</td>" + download + "</tr>");
             }
         }
         if (rows.size() == 0) {

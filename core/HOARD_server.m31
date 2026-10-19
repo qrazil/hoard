@@ -5,6 +5,8 @@
 //
 //     /                       the repositories the requester may read
 //     /<repo>.git/...         git smart HTTP (HOARD_cgi)
+//     /<repo>/archive/<tag>.tar.gz
+//                             a tag's source tarball (HOARD_archive)
 //     /<repo>/...             the repository's generated pages (HOARD_pages)
 //
 // Threads: the main thread accepts and moves each connection to a fixed pool
@@ -17,6 +19,7 @@
 // still unread closes the connection: the next request would start inside it.
 
 import core.HOARD_addr;
+import core.HOARD_archive;
 import core.HOARD_auth;
 import core.HOARD_cgi;
 import core.HOARD_gc;
@@ -310,6 +313,10 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
         case None: {
         }
     }
+    // Before the pages: nothing under `archive/` is ever a generated page.
+    if (rest.starts_with(HOARD_archive.PREFIX)) {
+        return archive(connection, incoming, HOARD_store.repo_git_directory(config, view.config_path, repo), repo, rest, is_public, path_env);
+    }
     return page(connection, incoming, fs.join(HOARD_store.pages_root(config, view.config_path), repo), repo, rest, is_public);
 }
 
@@ -474,6 +481,33 @@ HOARD_cgi.Next page(net.Conn connection, http.RequestStream incoming, str root, 
     match (resolve(root, relative)) {
         case Some(str file): {
             return send_file(connection, incoming, file, is_public);
+        }
+        case None: {
+            return plain(connection, incoming, 404, "not found");
+        }
+    }
+}
+
+// --- tag tarballs ---------------------------------------------------------------
+
+// A name outside the tag alphabet and a tag that does not exist are the same
+// 404, and neither reaches `git archive`; a bad name never reaches git at all.
+HOARD_cgi.Next archive(net.Conn connection, http.RequestStream incoming, str git_directory, str repo, str rest, bool is_public, str path_env) {
+    http.Request request = incoming.request();
+    if (request.method() != "GET" && request.method() != "HEAD") {
+        return plain(connection, incoming, 405, "method not allowed");
+    }
+    match (HOARD_archive.tag_of(rest)) {
+        case Some(str tag): {
+            HOARD_archive.Archive wanted = HOARD_archive.Archive(repo, tag, git_directory, path_env, is_public);
+            match (HOARD_archive.commit_of(wanted)) {
+                case Some(str sha): {
+                    return HOARD_archive.serve(connection, incoming, wanted, sha);
+                }
+                case None: {
+                    return plain(connection, incoming, 404, "not found");
+                }
+            }
         }
         case None: {
             return plain(connection, incoming, 404, "not found");
