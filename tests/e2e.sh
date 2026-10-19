@@ -25,6 +25,8 @@ if [ ! -x "$HOARD_BIN" ]; then
     echo "HOARD_BIN=$HOARD_BIN is not an executable" >&2
     exit 2
 fi
+# The hook names hoard by its resolved path (macOS's /var is /private/var).
+HOARD_BIN="$(cd "$(dirname "$HOARD_BIN")" && pwd -P)/$(basename "$HOARD_BIN")"
 for tool in git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "$tool is required" >&2
