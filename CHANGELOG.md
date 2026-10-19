@@ -22,3 +22,6 @@ First version: the m31 port of orogit.
 - `TCP_NODELAY` on every connection: no 40 ms Nagle stall per kept-alive
   request.
 - SHA-512 comes from m31 0.7.0's `lib/crypto/sha512`.
+- `install.sh --source URL [--sha256 HASH]` builds from a source tarball (for
+  example a hoard server's own tag tarball) with the m31 release named in
+  `M31_VERSION` and the system C compiler. CI reads the same file.

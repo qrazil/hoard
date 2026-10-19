@@ -5,9 +5,6 @@ name: Release
 # build never produces a release.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
-env:
-  M31_REF: v0.7.0
-
 on:
   push:
     tags:
@@ -35,11 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and extract the m31 release (${{ env.M31_REF }})
+      - name: Download and extract the m31 release named in M31_VERSION
         run: |
           set -euo pipefail
+          M31_REF=$(tr -d ' \n' < M31_VERSION)
           curl -fsSL -o "$RUNNER_TEMP/m31.tar.gz" \
-            "https://github.com/qrazil/m31/releases/download/${{ env.M31_REF }}/m31-${{ matrix.asset }}.tar.gz"
+            "https://github.com/qrazil/m31/releases/download/${M31_REF}/m31-${{ matrix.asset }}.tar.gz"
           mkdir -p "$RUNNER_TEMP/m31"
           tar -C "$RUNNER_TEMP/m31" -xzf "$RUNNER_TEMP/m31.tar.gz"
           chmod +x "$RUNNER_TEMP/m31/m31c"
