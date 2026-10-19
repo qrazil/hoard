@@ -86,7 +86,11 @@ if [ -n "$source_url" ]; then
     tar -C "$tmp/m31" -xzf "$tmp/m31-${asset}.tar.gz"
     chmod +x "$tmp/m31/m31c"
     echo "building hoard with m31 ${m31_version}..."
-    (cd "$tmp/source" && M31_ROOT="$tmp/m31" LANGC="$tmp/m31/m31c" bash scripts/build.sh -o "$tmp/hoard") >/dev/null
+    if ! (cd "$tmp/source" && M31_ROOT="$tmp/m31" LANGC="$tmp/m31/m31c" bash scripts/build.sh -o "$tmp/hoard") >"$tmp/build.log" 2>&1; then
+        cat "$tmp/build.log" >&2
+        echo "install.sh: the build failed; nothing installed" >&2
+        exit 1
+    fi
 else
     if [ -z "$version" ]; then
         base="https://github.com/${REPO}/releases/latest/download"
