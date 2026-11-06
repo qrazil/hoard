@@ -96,7 +96,7 @@ if bash scripts/build.sh -o "$BIN" >"$WORK/build.log" 2>&1; then
     else
         bad "program: --help" "$("$BIN" --help 2>&1)"
     fi
-    if [ "$("$BIN" --version 2>&1)" = "hoard 0.1.0" ]; then
+    if [ "$("$BIN" --version 2>&1)" = "hoard 0.1.1" ]; then
         note "program: --version"
     else
         bad "program: --version" "$("$BIN" --version 2>&1)"

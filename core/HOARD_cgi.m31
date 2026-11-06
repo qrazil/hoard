@@ -1,16 +1,16 @@
-// Git smart HTTP, by running `git http-backend` as a CGI program with
-// streamed pipes.
-//
-// The request body is copied into the backend's stdin a piece at a time and
-// its stdout is copied to the client the same way, so a clone or push of any
-// size moves through in constant memory. The backend's stderr is moved to a
-// thread of its own that logs it, so a chatty backend can never fill a pipe
-// nobody reads.
-//
-// The body is fed in full before the answer is read. That cannot deadlock on
-// git's stateless RPC, where upload-pack and receive-pack read their whole
-// request before they write anything large; orogit relies on the same
-// property.
+/* Git smart HTTP, by running `git http-backend` as a CGI program with
+ * streamed pipes.
+ *
+ * The request body is copied into the backend's stdin a piece at a time and
+ * its stdout is copied to the client the same way, so a clone or push of any
+ * size moves through in constant memory. The backend's stderr is moved to a
+ * thread of its own that logs it, so a chatty backend can never fill a pipe
+ * nobody reads.
+ *
+ * The body is fed in full before the answer is read. That cannot deadlock on
+ * git's stateless RPC, where upload-pack and receive-pack read their whole
+ * request before they write anything large; orogit relies on the same
+ * property. */
 
 import io;
 import net;
@@ -52,8 +52,8 @@ bool is_hex_run(str text, int from, int count) {
     return true;
 }
 
-/// Every path below `/<repo>.git` that `git http-backend` answers. Anything
-/// else is a 404, before a process is started.
+/** Every path below `/<repo>.git` that `git http-backend` answers. Anything
+ * else is a 404, before a process is started. */
 pub bool is_backend_path(str rest) {
     if (rest == "/HEAD" || rest == "/info/refs" || rest == "/git-upload-pack" || rest == "/git-receive-pack") {
         return true;
@@ -106,13 +106,13 @@ pub Option<str> query_value(str query, str name) {
     return Option<str>.None;
 }
 
-/// What `rest` (the path after `/<repo>.git`) needs: READ, WRITE, or "" for a
-/// path the backend does not serve.
-///
-/// Push is recognised in both places it can appear, and each is checked on
-/// its own: the ref advertisement `GET info/refs?service=git-receive-pack` and
-/// the pack upload `POST git-receive-pack`. The service checked here is the
-/// service that goes into QUERY_STRING, so it is the one the backend acts on.
+/** What `rest` (the path after `/<repo>.git`) needs: READ, WRITE, or "" for a
+ * path the backend does not serve.
+ *
+ * Push is recognised in both places it can appear, and each is checked on
+ * its own: the ref advertisement `GET info/refs?service=git-receive-pack` and
+ * the pack upload `POST git-receive-pack`. The service checked here is the
+ * service that goes into QUERY_STRING, so it is the one the backend acts on. */
 pub str access_needed(str rest, str query) {
     if (!is_backend_path(rest)) {
         return "";
@@ -161,9 +161,9 @@ pub type CgiHead {
     pub List<str> values;
 }
 
-/// The `Status:` and headers of a CGI header block ending in a blank line, or
-/// None when it is malformed. Headers that describe framing on the backend's
-/// side of the pipe are dropped: the server frames the response itself.
+/** The `Status:` and headers of a CGI header block ending in a blank line, or
+ * None when it is malformed. Headers that describe framing on the backend's
+ * side of the pipe are dropped: the server frames the response itself. */
 pub Option<CgiHead> parse_cgi_head(bytes head) {
     List<str> names = [];
     List<str> values = [];
@@ -229,8 +229,8 @@ pub type Call {
     pub str user;
     pub str address;
     pub str path_env;
-    // The environment variable holding the repository's mirror token
-    // (HOARD_mirror), or "".
+    /* The environment variable holding the repository's mirror token
+     * (HOARD_mirror), or "". */
     pub str token_env = "";
 }
 
@@ -259,8 +259,8 @@ void log_stderr(proc.Pipe stream, str label) {
     }
 }
 
-// A plain-text answer, written in one piece, after which the connection
-// closes.
+/* A plain-text answer, written in one piece, after which the connection
+ * closes. */
 Next refuse(net.Conn connection, http.Request request, int status, str message) {
     http.Response reply = http.text_response(message + "\n", status: status);
     match (http.write_response(connection, request, reply, false)) {
@@ -272,9 +272,9 @@ Next refuse(net.Conn connection, http.Request request, int status, str message) 
     return Next.Close;
 }
 
-/// Run the backend for `incoming` and stream its answer to `conn`. The caller
-/// has already decided the requester may do what `call.rest` asks. Answers
-/// what the connection does next.
+/** Run the backend for `incoming` and stream its answer to `conn`. The caller
+ * has already decided the requester may do what `call.rest` asks. Answers
+ * what the connection does next. */
 pub Next run(net.Conn connection, http.RequestStream incoming, Call call) {
     http.Request request = incoming.request();
     str label = request.method() + " /" + call.repo + ".git" + call.rest;
@@ -289,9 +289,9 @@ pub Next run(net.Conn connection, http.RequestStream incoming, Call call) {
         }
     }
     Map<str, str> env = {"PATH": call.path_env, "GATEWAY_INTERFACE": "CGI/1.1", "SERVER_PROTOCOL": "HTTP/1.1", "REQUEST_METHOD": request.method(), "GIT_PROJECT_ROOT": call.repo_root, "PATH_INFO": "/" + call.repo + ".git" + call.rest, "QUERY_STRING": query, "REMOTE_ADDR": call.address};
-    // Read access to this repository has been checked, and this variable is
-    // set only on this path: it tells the backend to serve the repository
-    // without a `git-daemon-export-ok` file.
+    /* Read access to this repository has been checked, and this variable is
+     * set only on this path: it tells the backend to serve the repository
+     * without a `git-daemon-export-ok` file. */
     env.set("GIT_HTTP_EXPORT_ALL", "1");
     copy_header(request, "content-type", env, "CONTENT_TYPE");
     copy_header(request, "content-length", env, "CONTENT_LENGTH");
@@ -310,11 +310,11 @@ pub Next run(net.Conn connection, http.RequestStream incoming, Call call) {
         // Also what makes the backend allow receive-pack at all.
         env.set("REMOTE_USER", call.user);
     }
-    // The post-receive hook pushes to the repository's mirror and needs its
-    // token, which only this process's environment holds. The one variable
-    // the mirror names is passed on, and only to a push: it reaches
-    // receive-pack and the hook through their environments, which only this
-    // user can read, never through an argv.
+    /* The post-receive hook pushes to the repository's mirror and needs its
+     * token, which only this process's environment holds. The one variable
+     * the mirror names is passed on, and only to a push: it reaches
+     * receive-pack and the hook through their environments, which only this
+     * user can read, never through an argv. */
     if (call.rest == "/git-receive-pack" && call.token_env != "" && !env.contains(call.token_env)) {
         match (os.env(call.token_env)) {
             case Some(str token): {
@@ -363,9 +363,9 @@ Next converse(net.Conn connection, http.RequestStream incoming, proc.Proc child,
                         case Ok(_): {
                         }
                         case Err(_): {
-                            // The backend stopped reading: that is its answer
-                            // (a refusal), and it is read below. The rest of the
-                            // body is unread, so the connection cannot be reused.
+                            /* The backend stopped reading: that is its answer
+                             * (a refusal), and it is read below. The rest of the
+                             * body is unread, so the connection cannot be reused. */
                             is_fed = false;
                             is_body_read = false;
                         }
@@ -432,8 +432,8 @@ Next converse(net.Conn connection, http.RequestStream incoming, proc.Proc child,
                             case Ok: {
                             }
                             case Err(_): {
-                                // The client went away. Dropping the child
-                                // kills and reaps the backend.
+                                /* The client went away. Dropping the child
+                                 * kills and reaps the backend. */
                                 return Next.Close;
                             }
                         }

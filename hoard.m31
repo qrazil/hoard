@@ -1,20 +1,20 @@
-// hoard -- a small self-hosted git server: HTTP only, Basic auth, static
-// browsable pages. See README.md and docs/design.md.
-//
-//     hoard [--config FILE] -<command> [args] [-<command> ...]
-//     hoard --help                 the commands
-//     hoard -<command> --help      one command's arguments
-//
-// The config file defaults to $HOARD_CONFIG, then ./hoard.json.
-//
-// The command line is `lib/args`, Oro's grammar: `-word` is a command,
-// `--word` an option, anything else data, so several commands fit on one line:
-//
-//     hoard -addrepo site --public -grant site alice write
-//
-// The whole line is parsed before any of it runs. The commands then run in
-// the order typed and the first one to fail stops the rest. Every command that
-// changes the config holds the admin lock (`<config>.lock`) while it does.
+/* hoard -- a small self-hosted git server: HTTP only, Basic auth, static
+ * browsable pages. See README.md and docs/design.md.
+ *
+ *     hoard [--config FILE] -<command> [args] [-<command> ...]
+ *     hoard --help                 the commands
+ *     hoard -<command> --help      one command's arguments
+ *
+ * The config file defaults to $HOARD_CONFIG, then ./hoard.json.
+ *
+ * The command line is `lib/args`, Oro's grammar: `-word` is a command,
+ * `--word` an option, anything else data, so several commands fit on one line:
+ *
+ *     hoard -addrepo site --public -grant site alice write
+ *
+ * The whole line is parsed before any of it runs. The commands then run in
+ * the order typed and the first one to fail stops the rest. Every command that
+ * changes the config holds the admin lock (`<config>.lock`) while it does. */
 
 import args;
 import core.HOARD_addr;
@@ -32,7 +32,7 @@ import os;
 import proc;
 import text;
 
-const str VERSION = "0.1.0";
+const str VERSION = "0.1.1";
 
 args.Parser table = args.Parser("hoard", summary: "a small self-hosted git server: HTTP only, Basic auth, static browsable pages");
 table.version = VERSION;
@@ -336,8 +336,8 @@ Result<str, str> read_password() {
             if (problem != "") {
                 return Result<str, str>.Err(problem);
             }
-            // A password of a token's shape would only ever be checked as a
-            // token (HOARD_server.identify), so it could never log in.
+            /* A password of a token's shape would only ever be checked as a
+             * token (HOARD_server.identify), so it could never log in. */
             if (HOARD_token.is_token_shaped(line)) {
                 return Result<str, str>.Err("a password may not have the form of an access token");
             }
@@ -351,9 +351,9 @@ Result<str, str> read_password() {
 
 // --- access tokens -----------------------------------------------------------
 
-/// Make a token, save its digest, and print the token: on stdout, once, and
-/// nowhere else. It is printed only after the save, so a token that is shown
-/// always works.
+/** Make a token, save its digest, and print the token: on stdout, once, and
+ * nowhere else. It is printed only after the save, so a token that is shown
+ * always works. */
 Result<void, str> add_token(str path, HOARD_store.Config config, str user, str name, bool is_read_only) {
     if (!config.users.contains(user)) {
         return Result<void, str>.Err("no user '" + user + "'");
@@ -441,11 +441,11 @@ Result<str, str> self_path() {
     return Result<str, str>.Err("could not find this program's own path for the hook");
 }
 
-/// Write `hooks/post-receive` beside the config: a shell script, mode 0755,
-/// that runs this binary to rebuild the pushed repository's pages and then,
-/// in the background, to push it to its mirror (HOARD_mirror). A push must
-/// not fail because its pages did not rebuild or its mirror did not take it,
-/// so it always exits 0.
+/** Write `hooks/post-receive` beside the config: a shell script, mode 0755,
+ * that runs this binary to rebuild the pushed repository's pages and then,
+ * in the background, to push it to its mirror (HOARD_mirror). A push must
+ * not fail because its pages did not rebuild or its mirror did not take it,
+ * so it always exits 0. */
 Result<void, str> write_hook(str path) {
     str program = self_path()?;
     if (program.contains("'") || path.contains("'")) {
@@ -454,8 +454,8 @@ Result<void, str> write_hook(str path) {
     str directory = hooks_directory(path);
     HOARD_store.make_dirs(directory)?;
     str hook = fs.join(directory, "post-receive");
-    // The mirror push runs in the background with every stream redirected,
-    // so receive-pack does not wait for it and the pusher never sees it.
+    /* The mirror push runs in the background with every stream redirected,
+     * so receive-pack does not wait for it and the pusher never sees it. */
     str log = fs.join(HOARD_store.parent_directory(path), "mirror.log");
     str script = "#!/bin/sh\n# Written by hoard: rebuild the pushed repository's pages, then push it to its mirror.\ncat >/dev/null\nrepo=$(git config --get hoard.repo) || { echo 'hoard: no hoard.repo setting; pages not rebuilt'; exit 0; }\n'" + program + "' --config '" + path + "' -regen --hook \"$repo\" || echo 'hoard: page generation failed'\n'" + program + "' --config '" + path + "' -mirror-now --hook \"$repo\" </dev/null >>'" + log + "' 2>&1 &\nexit 0\n";
     if (fs.is_present(hook)) {
@@ -524,8 +524,8 @@ Result<void, str> add_repo(str path, HOARD_store.Config config, str name, bool i
         HOARD_store.make_dirs(HOARD_store.repo_root(config, path))?;
         git(["git", "init", "--quiet", "--bare", "--initial-branch=main", git_directory])?;
     }
-    // Point the repository at hoard's hooks and name it, so post-receive can
-    // find its way back here.
+    /* Point the repository at hoard's hooks and name it, so post-receive can
+     * find its way back here. */
     git(["git", "--git-dir", git_directory, "config", "core.hooksPath", hooks_directory(path)])?;
     git(["git", "--git-dir", git_directory, "config", "hoard.repo", name])?;
     List<str> readers = [];
@@ -542,25 +542,25 @@ Result<void, str> add_repo(str path, HOARD_store.Config config, str name, bool i
 }
 
 // --- deleting and renaming ---------------------------------------------------
-//
-// hoard never destroys a repository. -delrepo moves it to repos/.trash (a
-// rename on the same filesystem, so atomic) and prints how to restore or purge
-// it; `.trash` cannot be a repository name, so it is never served or listed.
-// Pages are derived, so they are deleted, never following a symlink.
-//
-// Both run under the admin lock, in an order where a crash leaves a state the
-// same command finishes when run again:
-//
-//     -delrepo   1. repos/NAME.git -> repos/.trash/NAME-<UTC time>.git
-//                2. the config entry goes   3. pages/NAME goes
-//     -rename    1. repos/OLD.git -> repos/NEW.git
-//                2. hoard.repo = NEW in it (the hook reads it)
-//                3. the config entry moves, permissions with it
-//                4. pages/NEW rebuilt (links carry the name), pages/OLD goes
-//
-// After step 1 the config still names the repository, and a second run sees
-// the directory gone (-delrepo) or already moved (-rename) and goes on. After
-// the config step only pages are wrong: -regen NEW, and remove pages/OLD.
+/*
+ * hoard never destroys a repository. -delrepo moves it to repos/.trash (a
+ * rename on the same filesystem, so atomic) and prints how to restore or purge
+ * it; `.trash` cannot be a repository name, so it is never served or listed.
+ * Pages are derived, so they are deleted, never following a symlink.
+ *
+ * Both run under the admin lock, in an order where a crash leaves a state the
+ * same command finishes when run again:
+ *
+ *     -delrepo   1. repos/NAME.git -> repos/.trash/NAME-<UTC time>.git
+ *                2. the config entry goes   3. pages/NAME goes
+ *     -rename    1. repos/OLD.git -> repos/NEW.git
+ *                2. hoard.repo = NEW in it (the hook reads it)
+ *                3. the config entry moves, permissions with it
+ *                4. pages/NEW rebuilt (links carry the name), pages/OLD goes
+ *
+ * After step 1 the config still names the repository, and a second run sees
+ * the directory gone (-delrepo) or already moved (-rename) and goes on. After
+ * the config step only pages are wrong: -regen NEW, and remove pages/OLD. */
 
 const str TRASH = ".trash";
 
@@ -622,8 +622,8 @@ bool is_on_disk(str path) {
     return fs.is_present(path) || fs.is_link(path);
 }
 
-// `<trash>/<name>-20261018T120000Z.git`, with `-2`, `-3`... after the time
-// if a repository of that name was deleted in the same second.
+/* `<trash>/<name>-20261018T120000Z.git`, with `-2`, `-3`... after the time
+ * if a repository of that name was deleted in the same second. */
 str trash_path(str trash, str name) {
     str stamp = text.replace(text.replace(date.iso(date.now()), "-", ""), ":", "");
     str stem = name + "-" + stamp;
@@ -636,9 +636,9 @@ str trash_path(str trash, str name) {
     return candidate;
 }
 
-// Delete a repository's pages directory. `fs.rmtree` unlinks a symlink inside
-// the tree rather than following it, refuses one on the way down, and traps
-// on a path outside `root`; a valid name is one segment, so it never is.
+/* Delete a repository's pages directory. `fs.rmtree` unlinks a symlink inside
+ * the tree rather than following it, refuses one on the way down, and traps
+ * on a path outside `root`; a valid name is one segment, so it never is. */
 Result<void, str> remove_pages(str root, str name) {
     str pages = fs.join(root, name);
     if (!is_on_disk(pages)) {
@@ -712,8 +712,8 @@ Result<void, str> rename_repo(str path, HOARD_store.Config config, str old_name,
     str to_directory = HOARD_store.repo_git_directory(config, path, new_name);
     str again = "; run -rename " + old_name + " " + new_name + " again to finish";
     if (is_on_disk(to_directory)) {
-        // Only a rename that stopped after step 1 leaves the new directory,
-        // without the old one, still naming itself after either.
+        /* Only a rename that stopped after step 1 leaves the new directory,
+         * without the old one, still naming itself after either. */
         str named = git_value(to_directory, "hoard.repo");
         if (is_on_disk(from_directory) || (named != old_name && named != new_name)) {
             return Result<void, str>.Err(to_directory + " already exists on disk");
@@ -766,8 +766,8 @@ Result<void, str> cmd_regen(str path, args.Parsed command) {
     str name = command.positional("name");
     HOARD_store.Config config = HOARD_store.load(path)?;
     repo_of(config, name)?;
-    // From the hook, commit pages that already exist are kept (a commit never
-    // changes); by hand, everything is rebuilt.
+    /* From the hook, commit pages that already exist are kept (a commit never
+     * changes); by hand, everything is rebuilt. */
     print(HOARD_pages.regen(HOARD_store.repo_git_directory(config, path, name), fs.join(HOARD_store.pages_root(config, path), name), name, config.base_url, !command.is_flag_set("hook"))?);
     return Result<void, str>.Ok;
 }
@@ -844,8 +844,8 @@ Result<void, str> set_mirror(str path, HOARD_store.Config config, args.Parsed co
     entry.mirror_url = url;
     entry.mirror_token_env = token_env;
     entry.mirror_user = user;
-    // A hook written before mirroring existed does not start the mirror
-    // push; writing it again brings it up to date.
+    /* A hook written before mirroring existed does not start the mirror
+     * push; writing it again brings it up to date. */
     write_hook(path)?;
     HOARD_store.save(path, config)?;
     print(name + " now mirrors to " + url);
@@ -861,9 +861,9 @@ Result<void, str> cmd_mirror_now(str path, args.Parsed command) {
         print(HOARD_mirror.push(path, name)?);
         return Result<void, str>.Ok;
     }
-    // From the hook, in the background, its output appended to mirror.log:
-    // a repository without a mirror says nothing, and every outcome is one
-    // line with the time.
+    /* From the hook, in the background, its output appended to mirror.log:
+     * a repository without a mirror says nothing, and every outcome is one
+     * line with the time. */
     HOARD_store.Config config = HOARD_store.load(path)?;
     if (!HOARD_mirror.has_mirror(config, name)) {
         return Result<void, str>.Ok;

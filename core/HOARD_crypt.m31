@@ -1,32 +1,32 @@
-// SHA-512-crypt: the `$6$` password hashes of glibc's crypt(3) and
-// `openssl passwd -6`, which is the form hoard's config stores them in.
-//
-// API
+/* SHA-512-crypt: the `$6$` password hashes of glibc's crypt(3) and
+ * `openssl passwd -6`, which is the form hoard's config stores them in.
+ *
+ * API */
 // ---
-//   HOARD_crypt.password_problem(password)            -> str, "" or why it is refused
-//   HOARD_crypt.hash_password(password)               -> Result<str, str>, a new `$6$` hash
-//   HOARD_crypt.is_password_correct(password, stored) -> bool
-//   HOARD_crypt.is_ct_equal(left, right)              -> bool, in constant time
-//
-// The algorithm is Ulrich Drepper's "Unix crypt using SHA-256 and SHA-512"
-// (https://www.akkadia.org/drepper/SHA-crypt.txt), step for step, over
-// `lib/crypto/sha512` (m31 0.7.0 or later: plain 64-bit words, no allocation
-// per block, and `digest` restarts the hasher). The step numbers in the
-// comments below are the
-// specification's. orogit ran `openssl passwd -6` in a subprocess for this;
-// doing it in-process means no password ever travels over a pipe, and the
-// tests check the result against `openssl passwd -6` and the specification's
-// own vectors.
-//
-// A new hash uses 16 salt characters from the operating system's random
-// source (`random.system()`) and the default 5000 rounds, written without a
-// `rounds=` field, exactly as `openssl passwd -6` writes it. A stored hash
-// may carry `rounds=N$`; N is clamped to 1000 .. 999999999 as the
-// specification says, so a hash in the config costs whatever its author
-// chose -- the config is trusted, the password is not.
-//
-// The final comparison is constant time (`is_ct_equal`), so how long a wrong
-// password takes does not say how much of the hash it got right.
+/*   HOARD_crypt.password_problem(password)            -> str, "" or why it is refused
+ *   HOARD_crypt.hash_password(password)               -> Result<str, str>, a new `$6$` hash
+ *   HOARD_crypt.is_password_correct(password, stored) -> bool
+ *   HOARD_crypt.is_ct_equal(left, right)              -> bool, in constant time
+ *
+ * The algorithm is Ulrich Drepper's "Unix crypt using SHA-256 and SHA-512"
+ * (https://www.akkadia.org/drepper/SHA-crypt.txt), step for step, over
+ * `lib/crypto/sha512` (m31 0.7.0 or later: plain 64-bit words, no allocation
+ * per block, and `digest` restarts the hasher). The step numbers in the
+ * comments below are the
+ * specification's. orogit ran `openssl passwd -6` in a subprocess for this;
+ * doing it in-process means no password ever travels over a pipe, and the
+ * tests check the result against `openssl passwd -6` and the specification's
+ * own vectors.
+ *
+ * A new hash uses 16 salt characters from the operating system's random
+ * source (`random.system()`) and the default 5000 rounds, written without a
+ * `rounds=` field, exactly as `openssl passwd -6` writes it. A stored hash
+ * may carry `rounds=N$`; N is clamped to 1000 .. 999999999 as the
+ * specification says, so a hash in the config costs whatever its author
+ * chose -- the config is trusted, the password is not.
+ *
+ * The final comparison is constant time (`is_ct_equal`), so how long a wrong
+ * password takes does not say how much of the hash it got right. */
 
 import crypto.sha512;
 import random;
@@ -42,9 +42,9 @@ const int PASSWORD_MAX = 1024;
 const int ENCODED_SIZE = 86;
 const int DIGEST_SIZE = 64;
 
-// Step 22e: the digest octets that make each group of four characters, as
-// (#3, #2, #1) -- the first character holds the low six bits of #1. The
-// 22nd group is octet 63 alone, two characters, written out in `encode`.
+/* Step 22e: the digest octets that make each group of four characters, as
+ * (#3, #2, #1) -- the first character holds the low six bits of #1. The
+ * 22nd group is octet 63 alone, two characters, written out in `encode`. */
 const Array<int> GROUPS = [
     0, 21, 42, 22, 43, 1, 44, 2, 23, 3, 24, 45, 25, 46, 4, 47, 5, 26, 6, 27, 48,
     28, 49, 7, 50, 8, 29, 9, 30, 51, 31, 52, 10, 53, 11, 32, 12, 33, 54, 34, 55,
@@ -59,9 +59,9 @@ type Setting {
     str encoded;
 }
 
-/// Why `password` cannot be used, or "" when it can: it must not be empty,
-/// must not hold a line break or NUL (it is read one line from stdin), and
-/// must be at most 1024 bytes.
+/** Why `password` cannot be used, or "" when it can: it must not be empty,
+ * must not hold a line break or NUL (it is read one line from stdin), and
+ * must be at most 1024 bytes. */
 pub str password_problem(str password) {
     if (password.size() == 0) {
         return "the password is empty";
@@ -75,8 +75,8 @@ pub str password_problem(str password) {
     return "";
 }
 
-/// A new `$6$<salt>$<hash>` for `password`: a 16-character random salt and
-/// the default 5000 rounds. `Err` holds `password_problem`'s reason.
+/** A new `$6$<salt>$<hash>` for `password`: a 16-character random salt and
+ * the default 5000 rounds. `Err` holds `password_problem`'s reason. */
 pub Result<str, str> hash_password(str password) {
     str problem = password_problem(password);
     if (problem != "") {
@@ -99,9 +99,9 @@ pub Result<str, str> hash_password(str password) {
     }
 }
 
-/// Whether `password` matches `stored`, a `$6$[rounds=N$]<salt>$<hash>`
-/// with a salt of 1 to 16 characters. A malformed `stored`, or a password
-/// `password_problem` refuses, is `false`.
+/** Whether `password` matches `stored`, a `$6$[rounds=N$]<salt>$<hash>`
+ * with a salt of 1 to 16 characters. A malformed `stored`, or a password
+ * `password_problem` refuses, is `false`. */
 pub bool is_password_correct(str password, str stored) {
     if (password_problem(password) != "") {
         return false;
@@ -117,13 +117,13 @@ pub bool is_password_correct(str password, str stored) {
     }
 }
 
-/// Whether `left` and `right` hold the same octets, in a time that depends
-/// only on `left.size()`: every octet of `left` is compared, whatever
-/// `right` holds and wherever the two first differ.
+/** Whether `left` and `right` hold the same octets, in a time that depends
+ * only on `left.size()`: every octet of `left` is compared, whatever
+ * `right` holds and wherever the two first differ. */
 pub bool is_ct_equal(bytes left, bytes right) {
     int difference = left.size() ^ right.size();
-    // Unequal sizes are already a difference; `left` against itself keeps
-    // the loop the same length and in bounds.
+    /* Unequal sizes are already a difference; `left` against itself keeps
+     * the loop the same length and in bounds. */
     bytes other = left;
     if (difference == 0) {
         other = right;
@@ -142,8 +142,8 @@ Option<Setting> parse(str stored) {
     str rest = stored.substr(MAGIC.size(), stored.size());
     int rounds = ROUNDS_DEFAULT;
     if (rest.starts_with(ROUNDS_FIELD)) {
-        // As the specification's strtoul: a field that is not digits up to
-        // a '$' is not a rounds field, and is read as the salt instead.
+        /* As the specification's strtoul: a field that is not digits up to
+         * a '$' is not a rounds field, and is read as the salt instead. */
         match (rest.index_of("$")) {
             case Some(int end): {
                 Option<int> count = parse_rounds(rest.substr(ROUNDS_FIELD.size(), end));
@@ -174,9 +174,9 @@ Option<Setting> parse(str stored) {
     }
 }
 
-// The decimal `digits` clamped to ROUNDS_MIN .. ROUNDS_MAX, or None unless
-// they are one or more ASCII digits. A value past ROUNDS_MAX saturates, as
-// strtoul's does, rather than overflowing.
+/* The decimal `digits` clamped to ROUNDS_MIN .. ROUNDS_MAX, or None unless
+ * they are one or more ASCII digits. A value past ROUNDS_MAX saturates, as
+ * strtoul's does, rather than overflowing. */
 Option<int> parse_rounds(str digits) {
     if (digits.size() == 0) {
         return Option<int>.None;
@@ -198,8 +198,8 @@ Option<int> parse_rounds(str digits) {
     return Option<int>.Some(value);
 }
 
-// Steps 1-22e: the 86 encoded characters for `password` under `salt` (at
-// most 16 octets) and `rounds`.
+/* Steps 1-22e: the 86 encoded characters for `password` under `salt` (at
+ * most 16 octets) and `rounds`. */
 str sha512_crypt(bytes password, bytes salt, int rounds) {
     int password_size = password.size();
     sha512.Hasher hasher = sha512.Hasher();
@@ -266,8 +266,8 @@ bytes stretch(bytes digest, int size) {
     return out;
 }
 
-// Step 22e: the 64 digest octets as 86 characters of the crypt alphabet,
-// in the specification's octet order.
+/* Step 22e: the 64 digest octets as 86 characters of the crypt alphabet,
+ * in the specification's octet order. */
 str encode(bytes digest) {
     List<int> characters = [];
     for (int group in 0 .. 21) {

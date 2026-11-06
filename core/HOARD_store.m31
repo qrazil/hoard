@@ -1,25 +1,25 @@
-// The configuration file: names, loading, permissions and crash-safe saving.
-//
-// The config is one JSON document, the same schema as orogit's, so an orogit
-// install moves over by copying the file:
-//
-//     {
-//       "listen": "127.0.0.1:8789",
-//       "repo_root": "repos",
-//       "pages_root": "pages",
-//       "base_url": "https://git.example.org",
-//       "trusted_proxies": ["127.0.0.1"],
-//       "users": {"alice": {"hash": "$6$salt$...",
-//                           "tokens": {"ci": {"sha256": "...", "scope": "read", "created": "2026-10-18"}}}},
-//       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"],
-//                           "mirror": {"url": "https://github.com/o/hello.git", "token_env": "GH_TOKEN"}}},
-//       "gc_hours": 24
-//     }
-//
-// Relative paths are relative to the directory holding the config file. Keys
-// this program does not know (orogit's "oro") are kept and written back.
-// orogit reads only a user's "hash", so access tokens beside it (HOARD_token)
-// leave the file readable by orogit.
+/* The configuration file: names, loading, permissions and crash-safe saving.
+ *
+ * The config is one JSON document, the same schema as orogit's, so an orogit
+ * install moves over by copying the file:
+ *
+ *     {
+ *       "listen": "127.0.0.1:8789",
+ *       "repo_root": "repos",
+ *       "pages_root": "pages",
+ *       "base_url": "https://git.example.org",
+ *       "trusted_proxies": ["127.0.0.1"],
+ *       "users": {"alice": {"hash": "$6$salt$...",
+ *                           "tokens": {"ci": {"sha256": "...", "scope": "read", "created": "2026-10-18"}}}},
+ *       "repos": {"hello": {"public": true, "readers": [], "writers": ["alice"],
+ *                           "mirror": {"url": "https://github.com/o/hello.git", "token_env": "GH_TOKEN"}}},
+ *       "gc_hours": 24
+ *     }
+ *
+ * Relative paths are relative to the directory holding the config file. Keys
+ * this program does not know (orogit's "oro") are kept and written back.
+ * orogit reads only a user's "hash", so access tokens beside it (HOARD_token)
+ * leave the file readable by orogit. */
 
 import core.HOARD_addr;
 import encoding.json;
@@ -31,9 +31,9 @@ pub type Repo {
     pub bool is_public;
     pub List<str> readers;
     pub List<str> writers;
-    // The push mirror (HOARD_mirror): the remote's URL, "" for none; the
-    // environment variable holding its token, "" for none; and the user name
-    // sent with the token, "" for the default.
+    /* The push mirror (HOARD_mirror): the remote's URL, "" for none; the
+     * environment variable holding its token, "" for none; and the user name
+     * sent with the token, "" for the default. */
     pub str mirror_url = "";
     pub str mirror_token_env = "";
     pub str mirror_user = "";
@@ -76,8 +76,8 @@ pub Config default_config() {
 
 // --- names -------------------------------------------------------------------
 
-// Letters, digits, `.`, `_` and `-`, starting with a letter, digit or `_`, at
-// most `limit` bytes.
+/* Letters, digits, `.`, `_` and `-`, starting with a letter, digit or `_`, at
+ * most `limit` bytes. */
 bool is_simple_name(str name, int limit) {
     if (name.size() == 0 || name.size() > limit) {
         return false;
@@ -95,24 +95,24 @@ bool is_simple_name(str name, int limit) {
     return true;
 }
 
-/// A repository name is always exactly one path segment. `..` is refused
-/// anywhere, and so is a `.git` suffix, because `/<name>.git/` is the git URL
-/// of `<name>`: a repository called `foo.git` would make `/foo.git/` mean two
-/// things.
+/** A repository name is always exactly one path segment. `..` is refused
+ * anywhere, and so is a `.git` suffix, because `/<name>.git/` is the git URL
+ * of `<name>`: a repository called `foo.git` would make `/foo.git/` mean two
+ * things. */
 pub bool is_valid_repo_name(str name) {
     return is_simple_name(name, 100) && !name.contains("..") && !name.ends_with(".git");
 }
 
-/// A tag that gets a source tarball (HOARD_archive): the repository-name
-/// alphabet, so one path segment with no `/`, no leading `-` and nothing git
-/// reads as revision syntax (`^`, `~`, `:`, `@{`); and no `..`. Tags outside
-/// it are still listed, without a download.
+/** A tag that gets a source tarball (HOARD_archive): the repository-name
+ * alphabet, so one path segment with no `/`, no leading `-` and nothing git
+ * reads as revision syntax (`^`, `~`, `:`, `@{`); and no `..`. Tags outside
+ * it are still listed, without a download. */
 pub bool is_valid_tag_name(str name) {
     return is_simple_name(name, 100) && !name.contains("..");
 }
 
-/// The same alphabet; in particular no `:`, the separator inside an HTTP
-/// Basic credential.
+/** The same alphabet; in particular no `:`, the separator inside an HTTP
+ * Basic credential. */
 pub bool is_valid_user_name(str name) {
     return is_simple_name(name, 64);
 }
@@ -136,10 +136,10 @@ pub bool is_sha256_hex(str text) {
     return true;
 }
 
-/// A push mirror's URL: http(s) or file, no spaces or control bytes, and no
-/// password in it -- the token comes from `token_env` and is never written
-/// down. ssh is not offered: the post-receive hook runs without `$HOME`, so
-/// it would find no keys.
+/** A push mirror's URL: http(s) or file, no spaces or control bytes, and no
+ * password in it -- the token comes from `token_env` and is never written
+ * down. ssh is not offered: the post-receive hook runs without `$HOME`, so
+ * it would find no keys. */
 pub str mirror_url_problem(str url) {
     if (url.size() == 0 || url.size() > 2048) {
         return "the mirror URL is empty or longer than 2048 bytes";
@@ -175,9 +175,9 @@ pub str mirror_url_problem(str url) {
     return "";
 }
 
-/// An environment variable name: letters, digits and `_`, not starting with
-/// a digit. Names git reads itself (`GIT_*`) are refused, because the
-/// variable is passed to git's receive-pack (HOARD_cgi).
+/** An environment variable name: letters, digits and `_`, not starting with
+ * a digit. Names git reads itself (`GIT_*`) are refused, because the
+ * variable is passed to git's receive-pack (HOARD_cgi). */
 pub bool is_valid_env_name(str name) {
     if (name.size() == 0 || name.size() > 128 || name.starts_with("GIT_")) {
         return false;
@@ -280,9 +280,9 @@ pub str repo_git_directory(Config config, str config_path, str name) {
 
 // --- reading -----------------------------------------------------------------
 
-/// The text of the config, or None when it is missing or not a complete JSON
-/// object. `save` replaces the file by rename, so there is no half-written
-/// state to recover from, and a proper prefix of a JSON object never parses.
+/** The text of the config, or None when it is missing or not a complete JSON
+ * object. `save` replaces the file by rename, so there is no half-written
+ * state to recover from, and a proper prefix of a JSON object never parses. */
 pub Option<str> read_raw(str config_path) {
     if (!fs.is_file(config_path)) {
         return Option<str>.None;
@@ -318,11 +318,11 @@ pub Result<Config, str> load(str config_path) {
     }
 }
 
-/// The config in `text`, with missing keys filled in and entries of the wrong
-/// shape dropped, so the rest of the program never checks a level. A
-/// malformed `trusted_proxies` entry is an error rather than a silent
-/// mismatch: a proxy that stops being trusted makes every client share its
-/// address, and one attacker's failures would lock everyone out.
+/** The config in `text`, with missing keys filled in and entries of the wrong
+ * shape dropped, so the rest of the program never checks a level. A
+ * malformed `trusted_proxies` entry is an error rather than a silent
+ * mismatch: a proxy that stops being trusted makes every client share its
+ * address, and one attacker's failures would lock everyone out. */
 pub Result<Config, str> parse(str text) {
     Config config = default_config();
     Map<str, json.Value> fields = {};
@@ -385,8 +385,8 @@ pub Result<Config, str> parse(str text) {
                 if (is_valid_repo_name(name) && object_of(entry).is_some()) {
                     bool is_public = is_true(member(entry, "public"));
                     Repo parsed = Repo(is_public, names_of(member(entry, "readers")), names_of(member(entry, "writers")));
-                    // A mirror that is there but unusable is an error, not
-                    // dropped: a backup that silently stops is worse.
+                    /* A mirror that is there but unusable is an error, not
+                     * dropped: a backup that silently stops is worse. */
                     json.Value mirror = member(entry, "mirror");
                     if (object_of(mirror).is_some()) {
                         parsed.mirror_url = text_of(member(mirror, "url"), "");
@@ -407,9 +407,9 @@ pub Result<Config, str> parse(str text) {
     return Result<Config, str>.Ok(config);
 }
 
-// A user's well-formed tokens. One with a malformed digest or an unknown
-// scope is dropped: it could never match, or would match with a scope nobody
-// chose.
+/* A user's well-formed tokens. One with a malformed digest or an unknown
+ * scope is dropped: it could never match, or would match with a scope nobody
+ * chose. */
 Map<str, Token> tokens_of(json.Value value) {
     Map<str, Token> out = {};
     Map<str, json.Value> entries = object_of(value).or({});
@@ -425,8 +425,8 @@ Map<str, Token> tokens_of(json.Value value) {
 }
 
 // --- reading JSON values -----------------------------------------------------
-// One arm per variant, because a `match` has no default: these are the only
-// places the config reader names a variant it does not want.
+/* One arm per variant, because a `match` has no default: these are the only
+ * places the config reader names a variant it does not want. */
 
 str text_of(json.Value value, str fallback) {
     match (value) {
@@ -615,8 +615,8 @@ pub bool can_write(Config config, str repo, str user) {
     }
 }
 
-/// The environment variable the repository's mirror takes its token from,
-/// or "" when there is none.
+/** The environment variable the repository's mirror takes its token from,
+ * or "" when there is none. */
 pub str mirror_token_env(Config config, str repo) {
     match (config.repos.get(repo)) {
         case Some(Repo entry): {
@@ -711,18 +711,18 @@ List<json.Value> strings(List<str> items) {
     return out;
 }
 
-/// Write the config so that a crash at any instant leaves a complete document
-/// on disk: the new document goes to `<config>.tmp`, created with mode 0600
-/// because it holds password hashes, and is then renamed over the config. A
-/// rename within one filesystem is atomic, so a reader sees the old config or
-/// the new one, never half of either. The temp file sits beside the config
-/// because a rename across filesystems is not atomic.
+/** Write the config so that a crash at any instant leaves a complete document
+ * on disk: the new document goes to `<config>.tmp`, created with mode 0600
+ * because it holds password hashes, and is then renamed over the config. A
+ * rename within one filesystem is atomic, so a reader sees the old config or
+ * the new one, never half of either. The temp file sits beside the config
+ * because a rename across filesystems is not atomic. */
 pub Result<void, str> save(str config_path, Config config) {
     str text = render(config)?;
     str temp = config_path + ".tmp";
     if (fs.is_present(temp)) {
-        // A stray from a crash may carry other permissions; `open` keeps a
-        // file's mode, so start from nothing.
+        /* A stray from a crash may carry other permissions; `open` keeps a
+         * file's mode, so start from nothing. */
         match (fs.remove(temp)) {
             case Ok(_): {
             }
@@ -764,10 +764,10 @@ pub Result<void, str> save(str config_path, Config config) {
 
 // --- the admin lock ----------------------------------------------------------
 
-/// Take the admin lock: create `<config>.lock` with `mkdir`, which is atomic,
-/// so two admin commands cannot read, change and save the config at once and
-/// lose one update. A lock left by a crash is reported with the path to
-/// remove, never broken silently.
+/** Take the admin lock: create `<config>.lock` with `mkdir`, which is atomic,
+ * so two admin commands cannot read, change and save the config at once and
+ * lose one update. A lock left by a crash is reported with the path to
+ * remove, never broken silently. */
 pub Result<void, str> lock(str config_path) {
     str path = config_path + ".lock";
     match (fs.mkdir(path)) {

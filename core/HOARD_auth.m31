@@ -1,21 +1,21 @@
-// HTTP Basic credentials, and the guard: the one thread that owns the login
-// cache and the failed-login table.
-//
-// Workers share nothing mutable -- refcounts are not atomic -- so the state
-// every worker must see lives in the guard thread, and a worker asks it
-// questions over a channel, passing its own reply channel. Channels are
-// shared, not moved, so this needs no lock. Every string sent is a `clone`:
-// a send moves its value, and the move is refused at run time if anything
-// else still holds a reference to it.
-//
-// Password checking runs in the worker, never in the guard, so one slow
-// verification cannot hold up anyone else's request. The guard only answers
-// cache lookups and records outcomes.
-//
-// Damping: five failures from one client address within ten minutes lock it
-// out for 60 seconds, doubling with each further failure up to 15 minutes. A
-// failed attempt is also answered a quarter of a second late, which parks
-// only that worker.
+/* HTTP Basic credentials, and the guard: the one thread that owns the login
+ * cache and the failed-login table.
+ *
+ * Workers share nothing mutable -- refcounts are not atomic -- so the state
+ * every worker must see lives in the guard thread, and a worker asks it
+ * questions over a channel, passing its own reply channel. Channels are
+ * shared, not moved, so this needs no lock. Every string sent is a `clone`:
+ * a send moves its value, and the move is refused at run time if anything
+ * else still holds a reference to it.
+ *
+ * Password checking runs in the worker, never in the guard, so one slow
+ * verification cannot hold up anyone else's request. The guard only answers
+ * cache lookups and records outcomes.
+ *
+ * Damping: five failures from one client address within ten minutes lock it
+ * out for 60 seconds, doubling with each further failure up to 15 minutes. A
+ * failed attempt is also answered a quarter of a second late, which parks
+ * only that worker. */
 
 import core.HOARD_crypt;
 import crypto.sha256;
@@ -29,9 +29,9 @@ const int LOCKOUT_MAX_NS = 900000000000;
 pub const int FAILURE_DELAY_MS = 250;
 const int CACHE_NS = 300000000000;
 const int MAX_TRACKED = 10000;
-/// A well-formed hash no password produces, checked against when the user
-/// does not exist, so that "no such user" costs what "wrong password" costs
-/// and user names cannot be probed by timing.
+/** A well-formed hash no password produces, checked against when the user
+ * does not exist, so that "no such user" costs what "wrong password" costs
+ * and user names cannot be probed by timing. */
 pub const str DUMMY_HASH = "$6$hoarddummysalt$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 pub type Credentials {
@@ -39,9 +39,9 @@ pub type Credentials {
     pub str password;
 }
 
-/// The credentials in an `Authorization` header, or None when it is not a
-/// well-formed Basic credential. The caller tells "absent" from "malformed"
-/// by whether the header was there at all.
+/** The credentials in an `Authorization` header, or None when it is not a
+ * well-formed Basic credential. The caller tells "absent" from "malformed"
+ * by whether the header was there at all. */
 pub Option<Credentials> parse_basic(str header) {
     str trimmed = header.trim();
     match (trimmed.index_of(" ")) {
@@ -84,13 +84,13 @@ pub Option<Credentials> parse_basic(str header) {
 
 // --- the guard ---------------------------------------------------------------
 
-/// A question for the guard. Each that wants an answer carries the asking
-/// worker's reply channel.
+/** A question for the guard. Each that wants an answer carries the asking
+ * worker's reply channel. */
 pub enum Ask {
     /// Seconds left on the address's lockout, 0 when it is not locked out.
     Locked(str, Chan<int>);
-    /// 1 when this user, stored hash and password digest verified recently,
-    /// else 0.
+    /** 1 when this user, stored hash and password digest verified recently,
+     * else 0. */
     Cached(str, str, bytes, Chan<int>);
     /// Remember a verified login: user, stored hash, password digest.
     Remember(str, str, bytes);
@@ -208,8 +208,8 @@ void prune(Map<str, Failure> failures, int now) {
 
 // --- a worker's side ---------------------------------------------------------
 
-/// What a worker holds to talk to the guard: the shared question channel and
-/// its own reply channel.
+/** What a worker holds to talk to the guard: the shared question channel and
+ * its own reply channel. */
 pub type Guard {
     Chan<Ask> asks;
     Chan<int> replies;
@@ -221,9 +221,9 @@ pub int Guard.locked_for(str address) {
     return recv(replies);
 }
 
-/// Whether `password` is `user`'s, whose stored hash is `hash`. A recent
-/// verified login is answered from the cache; otherwise the hash is computed
-/// here, in the worker, and a match is remembered.
+/** Whether `password` is `user`'s, whose stored hash is `hash`. A recent
+ * verified login is answered from the cache; otherwise the hash is computed
+ * here, in the worker, and a match is remembered. */
 pub bool Guard.is_password_correct(str user, str hash, str password) {
     bytes digest = sha256.sum(password.to_bytes());
     send(asks, Ask.Cached(clone(user), clone(hash), clone(digest), replies));

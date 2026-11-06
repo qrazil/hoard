@@ -1,43 +1,43 @@
-// Push mirroring: after every push a repository is pushed on to a second
-// remote -- in practice GitHub, as an off-site backup and a public copy.
-//
-// The config names the remote per repository and, for one that needs a
-// login, the environment variable that holds the token:
-//
-//     "site": {"public": true, "readers": [], "writers": ["alice"],
-//              "mirror": {"url": "https://github.com/owner/site.git",
-//                         "token_env": "HOARD_GITHUB_TOKEN"}}
-//
-// The token is never in the config, on a command line, in a log or in the
-// URL. It is read from hoard's own environment and reaches git through a
-// credential helper that is a shell function, given on git's command line
-// with `-c`. The function's text names only a variable,
-// `$HOARD_MIRROR_TOKEN`, which is set in git's environment; the shell
-// expands it and prints it with the `printf` builtin, so no process is ever
-// started with the token in its argv, where `ps` shows it to every user. An
-// environment is readable only by the same user (and root). GIT_ASKPASS
-// pointing back at hoard would work as well, but needs a hidden mode in the
-// command line and one more exec per prompt for the same result. The helper
-// list is emptied first, so a helper in the user's git config never sees
-// (or stores) the token.
-//
-// The user name sent with the token is `x-access-token` unless the mirror
-// sets `"user"`: GitHub takes any name with a personal access token and
-// wants exactly that one with an app installation token; another hoard
-// wants a real user.
-//
-// What is pushed: refs/heads/* and refs/tags/*, forced, with `--prune` --
-// a branch or tag deleted here is deleted there. Not `--mirror`: that also
-// pushes and prunes every other ref, and GitHub keeps refs/pull/* that it
-// refuses to delete, so every mirror push would end in errors.
-//
-// When: the post-receive hook starts `-mirror-now --hook` in the background
-// after the pages are rebuilt, so a push never waits for, or fails because
-// of, its mirror; the outcome is appended to `mirror.log` beside the config.
-// Two pushes close together each start one. They take a lock directory in
-// the repository one after the other, and each pushes the refs as they are
-// when it gets the lock, so the last to run sends the newest refs: an older
-// push can never finish after a newer one and rewind the mirror.
+/* Push mirroring: after every push a repository is pushed on to a second
+ * remote -- in practice GitHub, as an off-site backup and a public copy.
+ *
+ * The config names the remote per repository and, for one that needs a
+ * login, the environment variable that holds the token:
+ *
+ *     "site": {"public": true, "readers": [], "writers": ["alice"],
+ *              "mirror": {"url": "https://github.com/owner/site.git",
+ *                         "token_env": "HOARD_GITHUB_TOKEN"}}
+ *
+ * The token is never in the config, on a command line, in a log or in the
+ * URL. It is read from hoard's own environment and reaches git through a
+ * credential helper that is a shell function, given on git's command line
+ * with `-c`. The function's text names only a variable,
+ * `$HOARD_MIRROR_TOKEN`, which is set in git's environment; the shell
+ * expands it and prints it with the `printf` builtin, so no process is ever
+ * started with the token in its argv, where `ps` shows it to every user. An
+ * environment is readable only by the same user (and root). GIT_ASKPASS
+ * pointing back at hoard would work as well, but needs a hidden mode in the
+ * command line and one more exec per prompt for the same result. The helper
+ * list is emptied first, so a helper in the user's git config never sees
+ * (or stores) the token.
+ *
+ * The user name sent with the token is `x-access-token` unless the mirror
+ * sets `"user"`: GitHub takes any name with a personal access token and
+ * wants exactly that one with an app installation token; another hoard
+ * wants a real user.
+ *
+ * What is pushed: refs/heads/* and refs/tags/*, forced, with `--prune` --
+ * a branch or tag deleted here is deleted there. Not `--mirror`: that also
+ * pushes and prunes every other ref, and GitHub keeps refs/pull/* that it
+ * refuses to delete, so every mirror push would end in errors.
+ *
+ * When: the post-receive hook starts `-mirror-now --hook` in the background
+ * after the pages are rebuilt, so a push never waits for, or fails because
+ * of, its mirror; the outcome is appended to `mirror.log` beside the config.
+ * Two pushes close together each start one. They take a lock directory in
+ * the repository one after the other, and each pushes the refs as they are
+ * when it gets the lock, so the last to run sends the newest refs: an older
+ * push can never finish after a newer one and rewind the mirror. */
 
 import core.HOARD_store;
 import fs;
@@ -51,8 +51,8 @@ const int PUSH_TIMEOUT_MS = 600000;
 const int LOCK_WAIT_MS = 660000;
 const int LOCK_POLL_MS = 250;
 const str DEFAULT_USER = "x-access-token";
-// Answers git's `get` with the user and the token from the environment and
-// says nothing to `store` or `erase`.
+/* Answers git's `get` with the user and the token from the environment and
+ * says nothing to `store` or `erase`. */
 const str HELPER = "!f() { if [ \"$1\" = get ]; then printf 'username=%s\\npassword=%s\\n' \"$HOARD_MIRROR_USER\" \"$HOARD_MIRROR_TOKEN\"; fi; }; f";
 
 /// Whether repository `name` exists and has a mirror.
@@ -75,8 +75,8 @@ pub str user_of(HOARD_store.Repo entry) {
     return DEFAULT_USER;
 }
 
-/// Push repository `name` to its mirror now. The line to report on success;
-/// the reason on failure, which never holds the token.
+/** Push repository `name` to its mirror now. The line to report on success;
+ * the reason on failure, which never holds the token. */
 pub Result<str, str> push(str config_path, str name) {
     HOARD_store.Config config = HOARD_store.load(config_path)?;
     HOARD_store.Repo entry = HOARD_store.Repo(false, [], []);
@@ -149,8 +149,8 @@ Result<str, str> run_push(List<str> argv, Map<str, str> env, str token, str labe
     }
 }
 
-// git does not print credentials, but a remote's own message might echo
-// one; whatever is logged has the token cut out.
+/* git does not print credentials, but a remote's own message might echo
+ * one; whatever is logged has the token cut out. */
 str redact(str text, str token) {
     if (token == "") {
         return text;
@@ -158,8 +158,8 @@ str redact(str text, str token) {
     return text.split(token).join("<token>");
 }
 
-// The environment git runs in: PATH and HOME only, as for the pages, and
-// never a prompt -- there is nobody to answer it.
+/* The environment git runs in: PATH and HOME only, as for the pages, and
+ * never a prompt -- there is nobody to answer it. */
 Map<str, str> git_env() {
     Map<str, str> env = {"PATH": os.env("PATH").or("/usr/local/bin:/usr/bin:/bin"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"};
     match (os.env("HOME")) {
@@ -172,9 +172,9 @@ Map<str, str> git_env() {
     return env;
 }
 
-// Wait for the repository's mirror lock (a directory, created atomically by
-// `mkdir`). A lock still held after any push could have ended is reported
-// with the path to remove, never broken silently.
+/* Wait for the repository's mirror lock (a directory, created atomically by
+ * `mkdir`). A lock still held after any push could have ended is reported
+ * with the path to remove, never broken silently. */
 Result<void, str> take_lock(str path, str label) {
     int waited_ms = 0;
     while (true) {

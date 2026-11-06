@@ -1,33 +1,33 @@
-// The static page generator, stagit-style: a port of orogit's pages.oro.
-//
-// For one repository it writes, under its pages directory:
-//
-//     index.html                 summary: clone path, branches, tags (each
-//                                with its tarball link), recent commits, and
-//                                the README (Markdown rendered by
-//                                HOARD_markdown, other text escaped)
-//     log.html                   the latest LOG_LIMIT commits
-//     files.html                 every file of the default branch
-//     file/<dir>.d/<name>.html   one page per file, highlighted by
-//                                HOARD_highlight when its language is known
-//     commit/<sha>.html          one page per commit, with its diff
-//
-// Everything comes from asking git -- `for-each-ref`, `log`, `ls-tree`,
-// `cat-file --batch`, `show` -- and every piece of text that came out of the
-// repository passes through `HOARD_html.escape` on its way into a page.
-//
-// THE SYMLINK RULE. A git repository may contain symlinks to anywhere --
-// `/etc/passwd`, `~/.ssh/id_ed25519`. So this generator never checks a
-// repository out and never copies a tree: every file under the pages
-// directory is one it wrote itself, as a regular file, from bytes git gave
-// it. A symlink in the repository becomes a page that *says* where the link
-// points; it is never a link on disk. The server refuses symlinks as well,
-// but this module must not depend on that.
-//
-// Each page is written to a temporary file and renamed over its path, so
-// the server never serves a half-written page. Stale pages -- a deleted file, a
-// commit force-pushed away -- are removed, and so are the directories they
-// leave empty.
+/* The static page generator, stagit-style: a port of orogit's pages.oro.
+ *
+ * For one repository it writes, under its pages directory:
+ *
+ *     index.html                 summary: clone path, branches, tags (each
+ *                                with its tarball link), recent commits, and
+ *                                the README (Markdown rendered by
+ *                                HOARD_markdown, other text escaped)
+ *     log.html                   the latest LOG_LIMIT commits
+ *     files.html                 every file of the default branch
+ *     file/<dir>.d/<name>.html   one page per file, highlighted by
+ *                                HOARD_highlight when its language is known
+ *     commit/<sha>.html          one page per commit, with its diff
+ *
+ * Everything comes from asking git -- `for-each-ref`, `log`, `ls-tree`,
+ * `cat-file --batch`, `show` -- and every piece of text that came out of the
+ * repository passes through `HOARD_html.escape` on its way into a page.
+ *
+ * THE SYMLINK RULE. A git repository may contain symlinks to anywhere --
+ * `/etc/passwd`, `~/.ssh/id_ed25519`. So this generator never checks a
+ * repository out and never copies a tree: every file under the pages
+ * directory is one it wrote itself, as a regular file, from bytes git gave
+ * it. A symlink in the repository becomes a page that *says* where the link
+ * points; it is never a link on disk. The server refuses symlinks as well,
+ * but this module must not depend on that.
+ *
+ * Each page is written to a temporary file and renamed over its path, so
+ * the server never serves a half-written page. Stale pages -- a deleted file, a
+ * commit force-pushed away -- are removed, and so are the directories they
+ * leave empty. */
 
 import core.HOARD_highlight;
 import core.HOARD_html;
@@ -58,15 +58,15 @@ const str TEMP_SUFFIX = ".tmp";
 const int TEMP_MAX_AGE_NS = 600 * 1000 * 1000 * 1000;
 const str LOG_FORMAT = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b";
 const List<str> REF_PREFIXES = ["refs/heads/", "refs/tags/"];
-// The README the summary shows: the first of these names, in any case, at
-// the top of the tree. The first two are Markdown.
+/* The README the summary shows: the first of these names, in any case, at
+ * the top of the tree. The first two are Markdown. */
 const List<str> README_NAMES = ["readme.md", "readme.markdown", "readme", "readme.txt", "readme.rst"];
 
 // --- talking to git ----------------------------------------------------------
 
-// One repository, and the clean environment every git command runs in: the
-// hook runs with GIT_DIR and friends set for the pushed repository, and
-// nothing inherited should steer these commands anywhere but `git_directory`.
+/* One repository, and the clean environment every git command runs in: the
+ * hook runs with GIT_DIR and friends set for the pushed repository, and
+ * nothing inherited should steer these commands anywhere but `git_directory`. */
 type Git {
     str git_directory;
     Map<str, str> env;
@@ -95,8 +95,8 @@ Option<bytes> Git.output(List<str> arguments) {
     }
 }
 
-// Start git with its standard input closed and its standard error drained
-// by a thread of its own, so a chatty git can never fill a pipe nobody reads.
+/* Start git with its standard input closed and its standard error drained
+ * by a thread of its own, so a chatty git can never fill a pipe nobody reads. */
 Result<proc.Proc, str> Git.launch(List<str> arguments) {
     match (proc.start(command(arguments), env: Option<Map<str, str>>.Some(env))) {
         case Ok(proc.Proc child): {
@@ -127,9 +127,9 @@ Result<Capped, str> Git.capped(List<str> arguments, int cap) {
     return Result<Capped, str>.Ok(Capped(data, true));
 }
 
-// The contents of every blob in `shas`, through one `git cat-file --batch`.
-// The object names are written by a thread of its own while this one reads,
-// so neither side can fill a pipe and wait on the other.
+/* The contents of every blob in `shas`, through one `git cat-file --batch`.
+ * The object names are written by a thread of its own while this one reads,
+ * so neither side can fill a pipe and wait on the other. */
 Result<Map<str, bytes>, str> Git.blobs(List<str> shas) {
     Map<str, bytes> found = {};
     if (shas.size() == 0) {
@@ -257,8 +257,8 @@ Result<bytes, str> read_exact(proc.Pipe source, int count) {
 
 // --- text helpers ------------------------------------------------------------
 
-/// Bytes as text for display: strict UTF-8 when it is valid, and otherwise
-/// valid runs kept with U+FFFD for each byte that is not.
+/** Bytes as text for display: strict UTF-8 when it is valid, and otherwise
+ * valid runs kept with U+FFFD for each byte that is not. */
 pub str lossy(bytes raw) {
     match (raw.utf8()) {
         case Some(str decoded): {
@@ -327,9 +327,9 @@ str esc(str raw) {
     return HOARD_html.escape(raw);
 }
 
-/// A repository path, as its segments, as the href of its file page relative
-/// to the repository's pages root. Each segment is percent-encoded for the
-/// URL; the escape makes the result safe inside a double-quoted attribute.
+/** A repository path, as its segments, as the href of its file page relative
+ * to the repository's pages root. Each segment is percent-encoded for the
+ * URL; the escape makes the result safe inside a double-quoted attribute. */
 pub str file_href(List<str> segments) {
     int last = segments.size() - 1;
     List<str> parts = ["file"];
@@ -340,9 +340,9 @@ pub str file_href(List<str> segments) {
     return esc(parts.join("/"));
 }
 
-/// The same page as a path on disk, relative to the repository's pages root.
-/// Directories carry a `.d` suffix and files an `.html` one, so a file
-/// `x.html` and a directory `x` can never both claim `x.html`.
+/** The same page as a path on disk, relative to the repository's pages root.
+ * Directories carry a `.d` suffix and files an `.html` one, so a file
+ * `x.html` and a directory `x` can never both claim `x.html`. */
 pub str file_disk_path(List<str> segments) {
     int last = segments.size() - 1;
     List<str> parts = ["file"];
@@ -353,8 +353,8 @@ pub str file_disk_path(List<str> segments) {
     return parts.join("/");
 }
 
-/// A diff as escaped HTML, one line per line: file headers bold, added lines
-/// class `a`, deleted lines class `d`, hunk headers class `h`.
+/** A diff as escaped HTML, one line per line: file headers bold, added lines
+ * class `a`, deleted lines class `d`, hunk headers class `h`. */
 pub str diff_markup(str diff) {
     List<str> lines = [];
     for (str line in diff.split("\n")) {
@@ -374,8 +374,8 @@ pub str diff_markup(str diff) {
     return lines.join("\n");
 }
 
-// `whole` split at the first `limit` occurrences of `separator`: at most
-// `limit + 1` fields, the last holding the rest.
+/* `whole` split at the first `limit` occurrences of `separator`: at most
+ * `limit + 1` fields, the last holding the rest. */
 List<str> split_limited(str whole, str separator, int limit) {
     List<str> fields = [];
     str rest = whole;
@@ -436,8 +436,8 @@ type Ref {
     str prefix;
 }
 
-// The branch the pages describe and its commit; "" and "" for an empty
-// repository.
+/* The branch the pages describe and its commit; "" and "" for an empty
+ * repository. */
 type Tip {
     str branch;
     str sha;
@@ -445,16 +445,16 @@ type Tip {
 
 // --- the generator -----------------------------------------------------------
 
-/// Regenerate the pages of `repo`, whose bare repository is `git_directory`, into
-/// `out_directory` (the repository's own pages directory, where its `index.html`
-/// goes). `base_url` is the server's public URL, for the clone command on
-/// the summary page. `is_full` rewrites commit pages that already exist
-/// (they are otherwise kept: a commit never changes). Returns a one-line
-/// summary.
-///
-/// Two pushes close together run two generators at once. Each one renders
-/// again until the branch it rendered is still the branch tip afterwards, so
-/// the last generator to finish has rendered the newest commit.
+/** Regenerate the pages of `repo`, whose bare repository is `git_directory`, into
+ * `out_directory` (the repository's own pages directory, where its `index.html`
+ * goes). `base_url` is the server's public URL, for the clone command on
+ * the summary page. `is_full` rewrites commit pages that already exist
+ * (they are otherwise kept: a commit never changes). Returns a one-line
+ * summary.
+ *
+ * Two pushes close together run two generators at once. Each one renders
+ * again until the branch it rendered is still the branch tip afterwards, so
+ * the last generator to finish has rendered the newest commit. */
 pub Result<str, str> regen(str git_directory, str out_directory, str repo, str base_url, bool is_full) {
     Git git = open_git(git_directory);
     make_directories(out_directory)?;
@@ -498,10 +498,10 @@ Tip tip_of(Git git) {
     if (heads.size() == 0) {
         return Tip("", "");
     }
-    // HEAD names a branch nobody pushed (a first push of `master` to a
-    // repository created with `main`, say). Point it at a branch that
-    // exists, so clones check something out and the pages have a default
-    // branch.
+    /* HEAD names a branch nobody pushed (a first push of `master` to a
+     * repository created with `main`, say). Point it at a branch that
+     * exists, so clones check something out and the pages have a default
+     * branch. */
     Option<bytes> repointed = git.output(["symbolic-ref", "HEAD", "refs/heads/" + heads[0].name]);
     return Tip(heads[0].name, heads[0].sha);
 }
@@ -760,8 +760,8 @@ str summary_page(Git git, str repo, str base_url, str branch, List<Commit> commi
                 if (short.size() > 12) {
                     short = short.substr(0, 12);
                 }
-                // A tag with a name the server will take gets its tarball
-                // (HOARD_archive), linked relative to this page.
+                /* A tag with a name the server will take gets its tarball
+                 * (HOARD_archive), linked relative to this page. */
                 str download = "";
                 if (found.prefix == "refs/tags/" && HOARD_store.is_valid_tag_name(found.name)) {
                     download = "<td><a href=\"archive/" + esc(found.name) + ".tar.gz\">" + esc(repo) + "-" + esc(found.name) + ".tar.gz</a></td>";
@@ -788,8 +788,8 @@ str summary_page(Git git, str repo, str base_url, str branch, List<Commit> commi
     return HOARD_html.document(repo, "", parts.join("\n"), repo);
 }
 
-// The README section of the summary, or "" when the tree has no README that
-// can be shown (none, binary, or over MAX_BLOB).
+/* The README section of the summary, or "" when the tree has no README that
+ * can be shown (none, binary, or over MAX_BLOB). */
 str readme(List<Entry> entries, Map<str, bytes> contents) {
     for (str wanted in README_NAMES) {
         for (Entry entry in entries) {
@@ -816,8 +816,8 @@ str readme(List<Entry> entries, Map<str, bytes> contents) {
     return "";
 }
 
-// Where a relative link in the README goes: a file to its page, a directory
-// (or the root) to the list of files. Links to anything else stay text.
+/* Where a relative link in the README goes: a file to its page, a directory
+ * (or the root) to the list of files. Links to anything else stay text. */
 type FileLinks {
     Map<str, str> targets;
 }
@@ -852,13 +852,13 @@ Result<void, str> make_directories(str path) {
     }
 }
 
-// Write `content` to `path` as a regular file, atomically: into a temporary
-// file of a random name at the top of `out` (the same file system), then
-// renamed over `path`. A rename replaces whatever name is at `path`, a
-// symlink included, and never writes through one. The name is random rather
-// than `<path>.tmp` because two generators run at once after two quick
-// pushes, and a shared temporary name lets one rename the other's
-// half-written file into place.
+/* Write `content` to `path` as a regular file, atomically: into a temporary
+ * file of a random name at the top of `out` (the same file system), then
+ * renamed over `path`. A rename replaces whatever name is at `path`, a
+ * symlink included, and never writes through one. The name is random rather
+ * than `<path>.tmp` because two generators run at once after two quick
+ * pushes, and a shared temporary name lets one rename the other's
+ * half-written file into place. */
 Result<void, str> write_file(str out, str path, str content) {
     str temp = fs.join(out, "." + random.system().hex(8) + TEMP_SUFFIX);
     match (io.write(temp, content)) {
@@ -880,9 +880,9 @@ Result<void, str> write_file(str out, str path, str content) {
     }
 }
 
-// Remove temporary files a generator left at the top of `out` when it died
-// between writing and renaming. Only old ones: a young one may belong to a
-// generator running now.
+/* Remove temporary files a generator left at the top of `out` when it died
+ * between writing and renaming. Only old ones: a young one may belong to a
+ * generator running now. */
 void remove_abandoned(str out) {
     match (fs.listdir(out)) {
         case Ok(List<str> names): {
@@ -912,10 +912,10 @@ void remove_abandoned(str out) {
     }
 }
 
-// Write a page at `relative` under `out`, creating its directories. An
-// error when the filesystem refuses (a name longer than the filesystem
-// allows, say): the caller then lists the file without a page rather than
-// failing the run.
+/* Write a page at `relative` under `out`, creating its directories. An
+ * error when the filesystem refuses (a name longer than the filesystem
+ * allows, say): the caller then lists the file without a page rather than
+ * failing the run. */
 Result<void, str> write_page(str out, str relative, str content) {
     List<str> parts = relative.split("/");
     str directory = parts.slice(0, parts.size() - 1).join("/");
@@ -923,10 +923,10 @@ Result<void, str> write_page(str out, str relative, str content) {
     return write_file(out, fs.join(out, relative), content);
 }
 
-// Remove every file under `out/sub` that this run did not write, so a
-// deleted file or a force-pushed-away commit does not stay published, and
-// every directory that leaves empty. Returns how many files went. A symlink
-// is never something this module wrote, so one is always removed.
+/* Remove every file under `out/sub` that this run did not write, so a
+ * deleted file or a force-pushed-away commit does not stay published, and
+ * every directory that leaves empty. Returns how many files went. A symlink
+ * is never something this module wrote, so one is always removed. */
 int remove_stale(str out, str sub, Map<str, bool> keep) {
     str base = fs.join(out, sub);
     if (fs.is_link(base) || !fs.is_directory(base)) {

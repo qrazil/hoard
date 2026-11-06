@@ -1,9 +1,9 @@
-// Runs the page generator once and prints its summary line.
-//
-//   t_pages_regen <git_dir> <out_dir> <repo> [--full]
-//
-// Not a unit test (it needs a repository); tests drive it against a
-// throwaway bare repository.
+/* Runs the page generator once and prints its summary line.
+ *
+ *   t_pages_regen <git_dir> <out_dir> <repo> [--full]
+ *
+ * Not a unit test (it needs a repository); tests drive it against a
+ * throwaway bare repository. */
 
 import core.HOARD_pages;
 import os;

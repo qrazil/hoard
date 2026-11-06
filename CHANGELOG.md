@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 (2026-11-06)
+
+Builds against m31 0.14.2 (`M31_VERSION`).
+
+- Comment runs are block comments (`m31c -lint --fix`), as the 0.14 linter
+  requires.
+
 ## 0.1.0 (2026-10-19)
 
 First version: the m31 port of orogit.

@@ -1,8 +1,8 @@
-// Unit tests for HOARD_token and the tokens in HOARD_store's config.
-//
-// The digest vector was made with Python's hashlib.sha256.
-//
-// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+/* Unit tests for HOARD_token and the tokens in HOARD_store's config.
+ *
+ * The digest vector was made with Python's hashlib.sha256.
+ *
+ * Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`. */
 
 import core.HOARD_store;
 import core.HOARD_token;
@@ -82,8 +82,8 @@ tally.check("find: a user without tokens has none", HOARD_token.find(none, ZEROS
 
 // --- the config ------------------------------------------------------------------
 
-// One user with two good tokens and three malformed ones, one with none, and
-// tokens under an entry with no hash (not a user).
+/* One user with two good tokens and three malformed ones, one with none, and
+ * tokens under an entry with no hash (not a user). */
 str digest_field = "{\"sha256\": \"" + ZEROS_DIGEST + "\", ";
 List<str> alice_tokens = [];
 alice_tokens.push("\"ci\": " + digest_field + "\"scope\": \"read\", \"created\": \"2026-10-18\"}");

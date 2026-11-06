@@ -1,6 +1,6 @@
-// Unit tests for HOARD_markdown (the README renderer) and HOARD_highlight.
-//
-// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+/* Unit tests for HOARD_markdown (the README renderer) and HOARD_highlight.
+ *
+ * Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`. */
 
 import core.HOARD_highlight;
 import core.HOARD_markdown;
@@ -54,8 +54,8 @@ int count_of(str haystack, str needle) {
     return haystack.split(needle).size() - 1;
 }
 
-// Every `<` in `html` opens a tag the renderer writes itself, and every
-// href is one it may write.
+/* Every `<` in `html` opens a tag the renderer writes itself, and every
+ * href is one it may write. */
 bool is_inert(str html) {
     List<str> tags = ["p>", "/p>", "em>", "/em>", "strong>", "/strong>", "code>", "/code>", "pre>", "/pre>", "/a>", "br>", "hr>", "ul>", "/ul>", "li>", "/li>", "blockquote>", "/blockquote>", "table>", "/table>", "tr>", "/tr>", "th>", "/th>", "td>", "/td>", "span class=\"", "/span>", "h1 id=\"", "/h1>"];
     List<str> hrefs = ["https://", "http://", "mailto:", "#", "file/", "files.html"];

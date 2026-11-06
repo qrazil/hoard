@@ -1,16 +1,16 @@
-// Repository housekeeping: `git gc` on a timer.
-//
-// git unpacks a push of fewer than 100 objects into loose files and only
-// repacks on its own (`gc --auto` after receive-pack) past about 6700 of
-// them, so a repository that takes many small pushes collects loose objects
-// that every clone has to compress again. The benchmark against orogit showed
-// a 24 MB repository cloning in 3.55 s loose and 0.22 s packed.
-//
-// So `serve` runs a pass every `gc_hours` hours (config, default 24; 0 turns
-// it off), as Gitea does on its own schedule. A pass skips any repository
-// that is already one pack and no loose objects -- the state `git gc` leaves
-// -- so a repository nobody pushed to costs one `git count-objects`. git's gc
-// is safe to run beside pushes and clones; its prune keeps two weeks' grace.
+/* Repository housekeeping: `git gc` on a timer.
+ *
+ * git unpacks a push of fewer than 100 objects into loose files and only
+ * repacks on its own (`gc --auto` after receive-pack) past about 6700 of
+ * them, so a repository that takes many small pushes collects loose objects
+ * that every clone has to compress again. The benchmark against orogit showed
+ * a 24 MB repository cloning in 3.55 s loose and 0.22 s packed.
+ *
+ * So `serve` runs a pass every `gc_hours` hours (config, default 24; 0 turns
+ * it off), as Gitea does on its own schedule. A pass skips any repository
+ * that is already one pack and no loose objects -- the state `git gc` leaves
+ * -- so a repository nobody pushed to costs one `git count-objects`. git's gc
+ * is safe to run beside pushes and clones; its prune keeps two weeks' grace. */
 
 import core.HOARD_store;
 import io;
@@ -20,9 +20,9 @@ import timer;
 
 const int HOUR_MS = 3600000;
 
-/// The housekeeping thread's body: sleep, run a pass, for ever. The interval
-/// is read from the config before each sleep, so a change takes effect after
-/// the current wait.
+/** The housekeeping thread's body: sleep, run a pass, for ever. The interval
+ * is read from the config before each sleep, so a change takes effect after
+ * the current wait. */
 pub void housekeeper(str config_path) {
     while (true) {
         int hours = 24;
@@ -52,8 +52,8 @@ pub void housekeeper(str config_path) {
     }
 }
 
-/// One pass over every configured repository: `git gc` where it is needed.
-/// One line per repository collected or failed; untouched ones say nothing.
+/** One pass over every configured repository: `git gc` where it is needed.
+ * One line per repository collected or failed; untouched ones say nothing. */
 pub Result<List<str>, str> collect(str config_path) {
     HOARD_store.Config config = HOARD_store.load(config_path)?;
     Map<str, str> env = git_env();
@@ -80,8 +80,8 @@ pub Result<List<str>, str> collect(str config_path) {
     return Result<List<str>, str>.Ok(lines);
 }
 
-// Whether the repository has loose objects or more than one pack, by `git
-// count-objects -v`. A repository git cannot read is left alone.
+/* Whether the repository has loose objects or more than one pack, by `git
+ * count-objects -v`. A repository git cannot read is left alone. */
 bool is_gc_needed(str git_directory, Map<str, str> env) {
     List<str> argv = ["git", "--git-dir", git_directory, "count-objects", "-v"];
     match (proc.run(argv, env: Option<Map<str, str>>.Some(clone(env)), should_check: false, is_quiet: true)) {

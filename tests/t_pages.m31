@@ -1,7 +1,7 @@
-// Unit tests for HOARD_html, the text helpers of HOARD_pages and the tag
-// names HOARD_archive accepts.
-//
-// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+/* Unit tests for HOARD_html, the text helpers of HOARD_pages and the tag
+ * names HOARD_archive accepts.
+ *
+ * Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`. */
 
 import core.HOARD_archive;
 import core.HOARD_html;

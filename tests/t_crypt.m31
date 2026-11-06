@@ -1,10 +1,10 @@
-// Unit tests for HOARD_crypt.
-//
-// The vectors are the SHA-512 ones from the specification
-// (https://www.akkadia.org/drepper/SHA-crypt.txt) and ones made with
-// `openssl passwd -6 -salt <salt> -stdin`, the password on stdin.
-//
-// Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`.
+/* Unit tests for HOARD_crypt.
+ *
+ * The vectors are the SHA-512 ones from the specification
+ * (https://www.akkadia.org/drepper/SHA-crypt.txt) and ones made with
+ * `openssl passwd -6 -salt <salt> -stdin`, the password on stdin.
+ *
+ * Output: one `ok`/`FAIL` line per check and a last line `N passed, M failed`. */
 
 import core.HOARD_crypt;
 

@@ -1,26 +1,26 @@
-// A small, safe Markdown to HTML renderer for the README on a summary page.
-//
-// The subset: ATX and setext headings, paragraphs, emphasis and strong
-// emphasis, inline code, fenced code blocks (highlighted by HOARD_highlight
-// when the fence names a language) and indented ones, bullet and ordered
-// lists (nested), block quotes, horizontal rules, simple tables, links,
-// autolinks and hard line breaks. Reference-style links, footnotes and
-// everything else stay text.
-//
-// THE SAFETY RULES. Every piece of the source reaches the page through
-// `HOARD_html.escape` (or `HOARD_highlight`, which escapes the same way), so
-// raw HTML in the Markdown is shown, never interpreted; the only markup on
-// the page is the fixed tags written here. A link keeps its destination only
-// when it is http:, https:, mailto: or a #fragment, or a relative path that
-// names a file of the repository, which then points at that file's page;
-// anything else -- javascript:, data:, a scheme spelled in mixed case or
-// split by a control character, a //host -- leaves the link text as plain
-// text. An image is never inlined (the pages allow images only from their
-// own origin): it becomes a link to its source.
-//
-// Everything here is linear in the size of the source: no backtracking, no
-// search that can restart from every position, and nesting (quotes inside
-// lists inside quotes...) stops at MAX_DEPTH, past which the rest is text.
+/* A small, safe Markdown to HTML renderer for the README on a summary page.
+ *
+ * The subset: ATX and setext headings, paragraphs, emphasis and strong
+ * emphasis, inline code, fenced code blocks (highlighted by HOARD_highlight
+ * when the fence names a language) and indented ones, bullet and ordered
+ * lists (nested), block quotes, horizontal rules, simple tables, links,
+ * autolinks and hard line breaks. Reference-style links, footnotes and
+ * everything else stay text.
+ *
+ * THE SAFETY RULES. Every piece of the source reaches the page through
+ * `HOARD_html.escape` (or `HOARD_highlight`, which escapes the same way), so
+ * raw HTML in the Markdown is shown, never interpreted; the only markup on
+ * the page is the fixed tags written here. A link keeps its destination only
+ * when it is http:, https:, mailto: or a #fragment, or a relative path that
+ * names a file of the repository, which then points at that file's page;
+ * anything else -- javascript:, data:, a scheme spelled in mixed case or
+ * split by a control character, a //host -- leaves the link text as plain
+ * text. An image is never inlined (the pages allow images only from their
+ * own origin): it becomes a link to its source.
+ *
+ * Everything here is linear in the size of the source: no backtracking, no
+ * search that can restart from every position, and nesting (quotes inside
+ * lists inside quotes...) stops at MAX_DEPTH, past which the rest is text. */
 
 import core.HOARD_highlight;
 import core.HOARD_html;
@@ -32,9 +32,9 @@ pub const int MAX_DEPTH = 16;
 // An autolink `<https://...>` is at most this long.
 const int MAX_AUTOLINK = 2048;
 
-/// Where a relative link goes: the href of the page for the repository path
-/// `path` ("" is the repository's root), or "" when there is none, which
-/// leaves the link as text.
+/** Where a relative link goes: the href of the page for the repository path
+ * `path` ("" is the repository's root), or "" when there is none, which
+ * leaves the link as text. */
 pub interface Links {
     str href(str path);
 }
@@ -50,8 +50,8 @@ pub str render(str source, Links links) {
 
 // --- blocks --------------------------------------------------------------------
 
-// The blocks of `lines`. `is_tight` drops the <p> around paragraphs, for the
-// items of a list with no blank line between them.
+/* The blocks of `lines`. `is_tight` drops the <p> around paragraphs, for the
+ * items of a list with no blank line between them. */
 str blocks(List<str> lines, int depth, bool is_tight, Links links) {
     List<str> out = [];
     if (depth >= MAX_DEPTH) {
@@ -104,8 +104,8 @@ str blocks(List<str> lines, int depth, bool is_tight, Links links) {
     return out.join("\n");
 }
 
-// A paragraph from `lines[start]` to a blank line or the start of another
-// block; a setext underline makes it a heading. Returns the next line.
+/* A paragraph from `lines[start]` to a blank line or the start of another
+ * block; a setext underline makes it a heading. Returns the next line. */
 int paragraph(List<str> lines, int start, bool is_tight, Links links, List<str> out) {
     List<str> body = [text.trim_start(lines[start])];
     int index = start + 1;
@@ -218,8 +218,8 @@ str heading_text(str line, int level) {
     return rest;
 }
 
-// A heading's id, as GitHub spells it, so a `#fragment` link in a README
-// reaches its heading: lower case, spaces to `-`, other punctuation dropped.
+/* A heading's id, as GitHub spells it, so a `#fragment` link in a README
+ * reaches its heading: lower case, spaces to `-`, other punctuation dropped. */
 str slug(str content) {
     bytes out = [];
     for (int octet in content.to_lower().to_bytes()) {
@@ -232,8 +232,8 @@ str slug(str content) {
     return out.utf8().or("");
 }
 
-// A block quote: its `>` lines and the lazy lines that continue its last
-// paragraph, rendered one level deeper.
+/* A block quote: its `>` lines and the lazy lines that continue its last
+ * paragraph, rendered one level deeper. */
 int quote(List<str> lines, int start, int depth, Links links, List<str> out) {
     List<str> body = [];
     int index = start;
@@ -256,9 +256,9 @@ int quote(List<str> lines, int start, int depth, Links links, List<str> out) {
     return index;
 }
 
-// A list item's marker: `width` is where its content starts (0: not a list
-// item), `kind` the bullet or the ordered delimiter, `number` an ordered
-// list's first number.
+/* A list item's marker: `width` is where its content starts (0: not a list
+ * item), `kind` the bullet or the ordered delimiter, `number` an ordered
+ * list's first number. */
 type Marker {
     int width;
     int kind = 0;
@@ -301,17 +301,17 @@ Marker list_marker(str line) {
     while (index + spaces < size && line.byte_at(index + spaces) == ' ') {
         spaces = spaces + 1;
     }
-    // Five spaces or more after the marker: the content is indented code,
-    // and starts one space after the marker.
+    /* Five spaces or more after the marker: the content is indented code,
+     * and starts one space after the marker. */
     if (spaces > 4 || index + spaces == size) {
         spaces = 1;
     }
     return Marker(index + spaces, kind: kind, number: number);
 }
 
-// A list: items with the same kind of marker, each holding the lines
-// indented under it. Loose (paragraphs in <p>) when a blank line separates
-// two items or two blocks of one item.
+/* A list: items with the same kind of marker, each holding the lines
+ * indented under it. Loose (paragraphs in <p>) when a blank line separates
+ * two items or two blocks of one item. */
 int list(List<str> lines, int start, int depth, Links links, List<str> out) {
     Marker first = list_marker(lines[start]);
     bool is_ordered = first.kind == '.' || first.kind == ')';
@@ -434,8 +434,8 @@ str row(List<str> cells, int width, str tag, Links links) {
     return parts.join("");
 }
 
-// A table row's cells: split at each `|` that is not escaped, without the
-// empty cells an outer `|` at either end makes.
+/* A table row's cells: split at each `|` that is not escaped, without the
+ * empty cells an outer `|` at either end makes. */
 List<str> cells_of(str line) {
     str trimmed = line.trim();
     bytes raw = trimmed.to_bytes();
@@ -594,10 +594,10 @@ bool is_quote(str line) {
 
 // --- inline ----------------------------------------------------------------------
 
-// A run of inline output: text and markup ready for the page, or a run of
-// `*` or `_` (`marker`) that may open or close emphasis. `count` is how
-// many of its characters no pairing has used; `closes` and `opens` collect
-// the tags pairing gave it.
+/* A run of inline output: text and markup ready for the page, or a run of
+ * `*` or `_` (`marker`) that may open or close emphasis. `count` is how
+ * many of its characters no pairing has used; `closes` and `opens` collect
+ * the tags pairing gave it. */
 type Piece {
     str html;
     int marker = 0;
@@ -608,8 +608,8 @@ type Piece {
     str opens = "";
 }
 
-// Inline Markdown as HTML. Inside a link's text (`is_in_link`) there are no
-// links, so anchors never nest, and an image is its alt text.
+/* Inline Markdown as HTML. Inside a link's text (`is_in_link`) there are no
+ * links, so anchors never nest, and an image is its alt text. */
 str inline(str source, Links links, bool is_in_link) {
     bytes raw = source.to_bytes();
     int size = raw.size();
@@ -701,8 +701,8 @@ str inline(str source, Links links, bool is_in_link) {
     return out.join("");
 }
 
-// For each `[` and `(` the index of the `]` or `)` that closes it, else -1.
-// One pass with a stack each, so finding a link's end never rescans.
+/* For each `[` and `(` the index of the `]` or `)` that closes it, else -1.
+ * One pass with a stack each, so finding a link's end never rescans. */
 List<int> partners(bytes raw) {
     int size = raw.size();
     List<int> partner = [-1; size];
@@ -767,8 +767,8 @@ int link(bytes raw, List<int> partner, int index, Links links, List<Piece> piece
     return end + 1;
 }
 
-// A link's destination from what its parentheses hold: `<...>` or up to the
-// first space (a title after it is dropped).
+/* A link's destination from what its parentheses hold: `<...>` or up to the
+ * first space (a title after it is dropped). */
 str destination(str inside) {
     str trimmed = inside.trim();
     if (trimmed.starts_with("<")) {
@@ -788,11 +788,11 @@ str destination(str inside) {
     return words[0];
 }
 
-/// The href a link to `target` may have, or "" when it may not have one: an
-/// http:, https: or mailto: URL as it is, a #fragment as it is, and a
-/// relative path to the page `links` gives for it. Everything else -- any
-/// other scheme in any spelling, a control character or space anywhere, a
-/// network-path `//host` -- is refused.
+/** The href a link to `target` may have, or "" when it may not have one: an
+ * http:, https: or mailto: URL as it is, a #fragment as it is, and a
+ * relative path to the page `links` gives for it. Everything else -- any
+ * other scheme in any spelling, a control character or space anywhere, a
+ * network-path `//host` -- is refused. */
 pub str safe_href(str target, Links links) {
     if (target == "") {
         return "";
@@ -822,8 +822,8 @@ pub str safe_href(str target, Links links) {
     if (target.starts_with("//") || target.starts_with("\\") || target.starts_with("/\\")) {
         return "";
     }
-    // A path in the repository: without its query and fragment, decoded,
-    // and with `.` and `..` resolved; climbing above the root is refused.
+    /* A path in the repository: without its query and fragment, decoded,
+     * and with `.` and `..` resolved; climbing above the root is refused. */
     str path = target;
     List<str> cuts = ["#", "?"];
     for (str cut in cuts) {
@@ -891,8 +891,8 @@ str NoLinks.href(str path) {
     return "";
 }
 
-// A run of `*` or `_`, and whether it can open or close emphasis
-// (CommonMark's flanking rules; `_` never opens or closes inside a word).
+/* A run of `*` or `_`, and whether it can open or close emphasis
+ * (CommonMark's flanking rules; `_` never opens or closes inside a word). */
 Piece delimiter(bytes raw, int index, int run) {
     int marker = raw[index];
     int before = ' ';
@@ -914,9 +914,9 @@ Piece delimiter(bytes raw, int index, int run) {
     return Piece("", marker: marker, count: run, can_open: can_open, can_close: can_close);
 }
 
-// Pair emphasis openers with closers, innermost first, with one stack per
-// marker. A pair throws away every opener between its ends, on both stacks,
-// so the tags always nest; each piece is pushed and popped at most once.
+/* Pair emphasis openers with closers, innermost first, with one stack per
+ * marker. A pair throws away every opener between its ends, on both stacks,
+ * so the tags always nest; each piece is pushed and popped at most once. */
 void pair_emphasis(List<Piece> pieces) {
     List<int> stars = [];
     List<int> underscores = [];
@@ -985,8 +985,8 @@ int run_of(bytes raw, int index) {
     return end - index;
 }
 
-// The start of the first run of exactly `run` backticks at or after `from`,
-// or -1.
+/* The start of the first run of exactly `run` backticks at or after `from`,
+ * or -1. */
 int closing_run(bytes raw, int from, int run) {
     int index = from;
     while (index < raw.size()) {
@@ -1003,8 +1003,8 @@ int closing_run(bytes raw, int from, int run) {
     return -1;
 }
 
-// A code span's text: line breaks become spaces, and one space is stripped
-// from each end when both ends have one.
+/* A code span's text: line breaks become spaces, and one space is stripped
+ * from each end when both ends have one. */
 str code_text(str inside) {
     str flat = text.replace(inside, "\n", " ");
     if (flat.size() >= 2 && flat.starts_with(" ") && flat.ends_with(" ") && flat.trim() != "") {
@@ -1017,8 +1017,8 @@ bool is_space(int octet) {
     return octet == ' ' || octet == '\t' || octet == '\n' || octet == '\r';
 }
 
-// ASCII punctuation: what a backslash escapes, and what the flanking rules
-// call punctuation.
+/* ASCII punctuation: what a backslash escapes, and what the flanking rules
+ * call punctuation. */
 bool is_punctuation(int octet) {
     return (octet >= '!' && octet <= '/') || (octet >= ':' && octet <= '@') || (octet >= '[' && octet <= '`') || (octet >= '{' && octet <= '~');
 }

@@ -1,22 +1,22 @@
-// The HTTP side: the accept loop, the worker pool, routing, authentication
-// and permission checks, the repository index and serving generated pages.
-//
-// URL layout:
-//
-//     /                       the repositories the requester may read
-//     /<repo>.git/...         git smart HTTP (HOARD_cgi)
-//     /<repo>/archive/<tag>.tar.gz
-//                             a tag's source tarball (HOARD_archive)
-//     /<repo>/...             the repository's generated pages (HOARD_pages)
-//
-// Threads: the main thread accepts and moves each connection to a fixed pool
-// of workers over a channel; the guard thread (HOARD_auth) owns the login
-// cache and the failed-login table. A worker serves one connection to the
-// end, then takes the next, so a long clone holds one worker, not the server.
-//
-// Request bodies are streamed (`read_request_stream`), so nothing is read
-// before the request has been authorised. A response sent while a body is
-// still unread closes the connection: the next request would start inside it.
+/* The HTTP side: the accept loop, the worker pool, routing, authentication
+ * and permission checks, the repository index and serving generated pages.
+ *
+ * URL layout:
+ *
+ *     /                       the repositories the requester may read
+ *     /<repo>.git/...         git smart HTTP (HOARD_cgi)
+ *     /<repo>/archive/<tag>.tar.gz
+ *                             a tag's source tarball (HOARD_archive)
+ *     /<repo>/...             the repository's generated pages (HOARD_pages)
+ *
+ * Threads: the main thread accepts and moves each connection to a fixed pool
+ * of workers over a channel; the guard thread (HOARD_auth) owns the login
+ * cache and the failed-login table. A worker serves one connection to the
+ * end, then takes the next, so a long clone holds one worker, not the server.
+ *
+ * Request bodies are streamed (`read_request_stream`), so nothing is read
+ * before the request has been authorised. A response sent while a body is
+ * still unread closes the connection: the next request would start inside it. */
 
 import core.HOARD_addr;
 import core.HOARD_archive;
@@ -40,8 +40,8 @@ const str DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin";
 
 // --- the server --------------------------------------------------------------
 
-/// Serve on `listen` ("host:port") until the process is stopped, with
-/// `workers` worker threads.
+/** Serve on `listen` ("host:port") until the process is stopped, with
+ * `workers` worker threads. */
 pub Result<void, str> serve(str config_path, str listen, int workers) {
     match (listen.index_of(":")) {
         case None: {
@@ -108,16 +108,16 @@ int last_colon(str text) {
     return -1;
 }
 
-/// A worker's view of the config: re-read on every request and re-parsed only
-/// when the bytes change.
+/** A worker's view of the config: re-read on every request and re-parsed only
+ * when the bytes change. */
 type View {
     str config_path;
     str raw = "";
     HOARD_store.Config config = HOARD_store.default_config();
 }
 
-// The current config, or the last good one when the file is unreadable
-// mid-replace (it never is, given `save`'s rename, but a hand edit can be).
+/* The current config, or the last good one when the file is unreadable
+ * mid-replace (it never is, given `save`'s rename, but a hand edit can be). */
 HOARD_store.Config View.current() {
     match (HOARD_store.read_raw(config_path)) {
         case Some(str text): {
@@ -162,10 +162,10 @@ void serve_connection(net.Conn connection, View view, HOARD_auth.Guard guard, st
         case Err(_): {
         }
     }
-    // A response goes out as a head and then body pieces, in separate
-    // writes. With Nagle's algorithm on, the last small write waits for the
-    // peer's delayed ACK, which cost 40 ms per request on a kept-alive
-    // connection -- every request git sends after its first.
+    /* A response goes out as a head and then body pieces, in separate
+     * writes. With Nagle's algorithm on, the last small write waits for the
+     * peer's delayed ACK, which cost 40 ms per request on a kept-alive
+     * connection -- every request git sends after its first. */
     match (connection.set_nodelay(true)) {
         case Ok(_): {
         }
@@ -201,8 +201,8 @@ void serve_connection(net.Conn connection, View view, HOARD_auth.Guard guard, st
     }
 }
 
-// A malformed request: answered with the module's own status and sentence,
-// then the connection closes.
+/* A malformed request: answered with the module's own status and sentence,
+ * then the connection closes. */
 void answer_error(net.Conn connection, http.Error failure) {
     http.Response reply = http.text_response(failure.to_str() + "\n", status: failure.status());
     reply.set("connection", "close");
@@ -240,9 +240,9 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
     http.Request request = incoming.request();
     HOARD_store.Config config = view.current();
     str path = request.path();
-    // `path()` is already percent-decoded, so `%2e%2e` and `%2f` arrive here
-    // as the `..` and `/` they spell, and are refused as such -- before a name
-    // is looked up, the filesystem is touched or git is run.
+    /* `path()` is already percent-decoded, so `%2e%2e` and `%2f` arrive here
+     * as the `..` and `/` they spell, and are refused as such -- before a name
+     * is looked up, the filesystem is touched or git is run. */
     if (!path.starts_with("/") || path.contains("\\") || path.contains(str.from_chars([0]))) {
         return plain(connection, incoming, 400, "bad path");
     }
@@ -292,16 +292,16 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
     }
     bool is_allowed = HOARD_store.can_read(config, repo, user);
     if (need == HOARD_cgi.WRITE) {
-        // A read-only token is its user with the writes taken away, so a
-        // push with one is refused exactly as a reader's is.
+        /* A read-only token is its user with the writes taken away, so a
+         * push with one is refused exactly as a reader's is. */
         is_allowed = HOARD_store.can_write(config, repo, user) && !is_read_only;
     }
     if (!is_allowed) {
         if (user == "") {
             return deny(connection, incoming, 401, 0);
         }
-        // A reader who may not push learns that they may not; anyone else
-        // learns nothing about whether the repository exists.
+        /* A reader who may not push learns that they may not; anyone else
+         * learns nothing about whether the repository exists. */
         if (need == HOARD_cgi.WRITE && HOARD_store.can_read(config, repo, user)) {
             return plain(connection, incoming, 403, "forbidden");
         }
@@ -329,10 +329,10 @@ HOARD_cgi.Next handle(net.Conn connection, http.RequestStream incoming, View vie
     return page(connection, incoming, fs.join(HOARD_store.pages_root(config, view.config_path), repo), repo, rest, is_public);
 }
 
-// An anonymous identity when there is no Authorization header, a user when it
-// holds a valid login (a password, or an access token), and a denial
-// otherwise. A wrong password or token is never downgraded to anonymous
-// access.
+/* An anonymous identity when there is no Authorization header, a user when it
+ * holds a valid login (a password, or an access token), and a denial
+ * otherwise. A wrong password or token is never downgraded to anonymous
+ * access. */
 Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard guard, str address) {
     match (request.header("authorization")) {
         case None: {
@@ -346,10 +346,10 @@ Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard g
             match (HOARD_auth.parse_basic(header)) {
                 case Some(HOARD_auth.Credentials credentials): {
                     if (HOARD_token.is_token_shaped(credentials.password)) {
-                        // An access token: one SHA-256 against the user's
-                        // token digests, never the 30 ms crypt verify. A user
-                        // that does not exist is compared with a dummy
-                        // digest, the same work as a wrong token.
+                        /* An access token: one SHA-256 against the user's
+                         * token digests, never the 30 ms crypt verify. A user
+                         * that does not exist is compared with a dummy
+                         * digest, the same work as a wrong token. */
                         Map<str, HOARD_store.Token> tokens = config.tokens.get(credentials.user).or({});
                         match (HOARD_token.find(tokens, credentials.password)) {
                             case Some(HOARD_store.Token token): {
@@ -372,8 +372,8 @@ Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard g
                             }
                         }
                         case None: {
-                            // The same work as a wrong password, so user names
-                            // cannot be found by timing.
+                            /* The same work as a wrong password, so user names
+                             * cannot be found by timing. */
                             guard.is_password_correct("", HOARD_auth.DUMMY_HASH, credentials.password);
                         }
                     }
@@ -389,8 +389,8 @@ Who identify(HOARD_store.Config config, http.Request request, HOARD_auth.Guard g
 
 // --- answers -----------------------------------------------------------------
 
-// Send `reply`, buffered; the connection stays open only if the request body
-// was read to the end and neither side said close.
+/* Send `reply`, buffered; the connection stays open only if the request body
+ * was read to the end and neither side said close. */
 HOARD_cgi.Next send_reply(net.Conn connection, http.RequestStream incoming, http.Response reply) {
     http.Request request = incoming.request();
     bool is_keep_alive = incoming.is_finished() && http.should_keep_alive(request, reply);
@@ -419,8 +419,8 @@ HOARD_cgi.Next deny(net.Conn connection, http.RequestStream incoming, int status
     return send_reply(connection, incoming, reply);
 }
 
-// Sent with every generated page. The pages are escaped as they are written;
-// this is the second line of defence: no script, frame or plugin may run.
+/* Sent with every generated page. The pages are escaped as they are written;
+ * this is the second line of defence: no script, frame or plugin may run. */
 void page_headers(http.Response reply, bool is_public) {
     reply.set("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'");
     reply.set("x-content-type-options", "nosniff");
@@ -448,8 +448,8 @@ HOARD_cgi.Next index_page(net.Conn connection, http.RequestStream incoming, HOAR
             return deny(connection, incoming, status, retry);
         }
     }
-    // `/?login` asks the browser for credentials, so private repositories can
-    // be listed without a separate login page.
+    /* `/?login` asks the browser for credentials, so private repositories can
+     * be listed without a separate login page. */
     if (user == "" && request.query().split("&").contains("login")) {
         return deny(connection, incoming, 401, 0);
     }
@@ -519,8 +519,8 @@ HOARD_cgi.Next page(net.Conn connection, http.RequestStream incoming, str root, 
 
 // --- tag tarballs ---------------------------------------------------------------
 
-// A name outside the tag alphabet and a tag that does not exist are the same
-// 404, and neither reaches `git archive`; a bad name never reaches git at all.
+/* A name outside the tag alphabet and a tag that does not exist are the same
+ * 404, and neither reaches `git archive`; a bad name never reaches git at all. */
 HOARD_cgi.Next archive(net.Conn connection, http.RequestStream incoming, str git_directory, str repo, str rest, bool is_public, str path_env) {
     http.Request request = incoming.request();
     if (request.method() != "GET" && request.method() != "HEAD") {
@@ -544,10 +544,10 @@ HOARD_cgi.Next archive(net.Conn connection, http.RequestStream incoming, str git
     }
 }
 
-/// The regular file `relative` names under `root`, or None. Every component is
-/// checked not to be a symbolic link, and the real path must stay inside the
-/// real root: the generator only writes regular files, and this holds even if
-/// something else has put a link in the tree.
+/** The regular file `relative` names under `root`, or None. Every component is
+ * checked not to be a symbolic link, and the real path must stay inside the
+ * real root: the generator only writes regular files, and this holds even if
+ * something else has put a link in the tree. */
 pub Option<str> resolve(str root, str relative) {
     str current = root;
     for (str segment in relative.split("/")) {
